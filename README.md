@@ -1,5 +1,3 @@
-<p align="center"><img src="ui/assets/icon.png" width="128" alt="OBR Music Tool icon"></p>
-
 # OBR Music Tool
 
 Replace the music in **The Elder Scrolls IV: Oblivion Remastered** with your own tracks.
