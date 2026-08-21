@@ -6,6 +6,14 @@ no hex editing, no hand-built soundbanks. Everything runs locally on your PC.
 
 ![OBR Music Tool](docs/screenshot-2026-08-21.png)
 
+## Download
+
+Get the latest build from the [Releases page](https://github.com/LorexValkin/OBR-Music-Tool/releases). Unzip it
+anywhere and run `obr-music-tool.exe`; there is no installer and no admin rights are needed. Current builds are
+**alpha** releases, so keep a copy of your playlist and report anything odd with the Activity log attached.
+
+Before converting audio you will need Wwise Authoring installed once; see [Installing Wwise](#installing-wwise).
+
 ## What it does
 
 - **Lists every vanilla music track**: Battle, Dungeon, Explore, Public (towns) and Special (title screen, death, success), with built-in preview playback so you know which track you are replacing.
