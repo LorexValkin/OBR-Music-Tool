@@ -258,11 +258,20 @@ fn tracks_to_model(tracks: &[TrackInfo]) -> slint::ModelRc<TrackEntry> {
 // Staging
 // ---------------------------------------------------------------------------
 
-fn staging_dir() -> PathBuf {
+fn app_data_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    base.join("OBRMusicTool").join("staging")
+    base.join("OBRMusicTool")
+}
+
+fn staging_dir() -> PathBuf {
+    app_data_dir().join("staging")
+}
+
+/// Exists once the user has ticked "Don't show this again" on the copyright reminder.
+fn export_warning_marker() -> PathBuf {
+    app_data_dir().join("export-warning-acknowledged")
 }
 
 fn stage_wem(wwise_id: u64, source: &Path) -> Result<()> {
@@ -458,6 +467,70 @@ fn write_release_zip(
 
     zip.finish().context("finalizing ZIP")?.flush()?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Playlists: which audio file goes on which track, so a mod can be reopened
+// and tweaked later. Plain text, keyed by Wwise id so it survives reordering.
+// ---------------------------------------------------------------------------
+
+const PLAYLIST_EXT: &str = "obrplaylist";
+const PLAYLIST_HEADER: &str = "# OBR Music Tool playlist v1";
+
+fn playlist_text(replacements: &[Option<PathBuf>]) -> String {
+    let mut lines = vec![
+        PLAYLIST_HEADER.to_string(),
+        "# One line per replaced track: <wwise id> = <audio file path>".to_string(),
+    ];
+    for (wt, source) in WWISE_TRACKS.iter().zip(replacements) {
+        if let Some(source) = source {
+            lines.push(String::new());
+            lines.push(format!("# {} / {}", wt.category, wt.display_name));
+            lines.push(format!("{} = {}", wt.wwise_id, source.display()));
+        }
+    }
+    lines.push(String::new());
+    lines.join("\r\n")
+}
+
+/// Parses playlist text into `(wwise_id, path)` pairs. Unknown ids are kept so
+/// the caller can report them; comments and blank lines are ignored.
+fn parse_playlist(text: &str) -> Result<Vec<(u64, PathBuf)>> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut lines = text.lines().map(str::trim);
+    if lines.next() != Some(PLAYLIST_HEADER) {
+        bail!("not an OBR Music Tool playlist (missing header line)");
+    }
+    let mut entries = Vec::new();
+    for (n, line) in lines.enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((id, path)) = line.split_once('=') else {
+            bail!("line {}: expected '<wwise id> = <path>'", n + 2);
+        };
+        let id: u64 = id
+            .trim()
+            .parse()
+            .with_context(|| format!("line {}: bad track id '{}'", n + 2, id.trim()))?;
+        let path = path.trim();
+        if path.is_empty() {
+            bail!("line {}: empty path", n + 2);
+        }
+        entries.push((id, PathBuf::from(path)));
+    }
+    Ok(entries)
+}
+
+fn save_playlist(path: &Path, replacements: &[Option<PathBuf>]) -> Result<()> {
+    fs::write(path, playlist_text(replacements))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+fn load_playlist(path: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    parse_playlist(&text)
 }
 
 // ---------------------------------------------------------------------------
@@ -799,6 +872,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }));
 
     let _ = clear_staging();
+    app.set_export_warning_dismissed(export_warning_marker().is_file());
 
     if let Some(cli) = find_wwise_cli() {
         app.set_wwise_path(cli.parent().unwrap_or(cli.as_path()).to_string_lossy().to_string().into());
@@ -1235,6 +1309,143 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
+    {
+        let weak = app.as_weak();
+        app.on_export_warning_dismiss(move || {
+            let Some(app) = weak.upgrade() else { return };
+            let marker = export_warning_marker();
+            let written = marker
+                .parent()
+                .map(fs::create_dir_all)
+                .unwrap_or(Ok(()))
+                .and_then(|()| fs::write(&marker, b"delete this file to see the copyright reminder again\n"));
+            match written {
+                Ok(()) => append_log(
+                    &app,
+                    &format!("Copyright reminder hidden. Delete {} to bring it back.", marker.display()),
+                ),
+                Err(e) => append_log(&app, &format!("Could not remember that choice: {}", e)),
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let shared = shared.clone();
+        app.on_save_playlist(move || {
+            let Some(app) = weak.upgrade() else { return };
+            let replacements = state(&shared).replacements.clone();
+            let count = replacements.iter().filter(|r| r.is_some()).count();
+            if count == 0 {
+                set_status(&app, "Nothing to save", "No tracks queued.", Tone::Error);
+                return;
+            }
+
+            let Some(path) = rfd::FileDialog::new()
+                .set_title("Save playlist")
+                .set_file_name(format!("MyMusicMod.{}", PLAYLIST_EXT))
+                .add_filter("OBR Music Tool playlist", &[PLAYLIST_EXT])
+                .save_file()
+            else {
+                return;
+            };
+            let path = ensure_extension(path, PLAYLIST_EXT);
+
+            match save_playlist(&path, &replacements) {
+                Ok(()) => {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    set_status(
+                        &app,
+                        "Playlist saved",
+                        &format!("{} track(s) saved to {}.", count, name),
+                        Tone::Success,
+                    );
+                    append_log(&app, &format!("Playlist saved: {}", path.display()));
+                }
+                Err(e) => {
+                    set_status(&app, "Save failed", &e.to_string(), Tone::Error);
+                    append_log(&app, &format!("Playlist error: {}", e));
+                }
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let shared = shared.clone();
+        let model = track_model.clone();
+        app.on_load_playlist(move || {
+            let Some(app) = weak.upgrade() else { return };
+            let Some(game_root) = state(&shared).game_root.clone() else {
+                set_status(
+                    &app,
+                    "No game folder",
+                    "Connect the game folder before opening a playlist.",
+                    Tone::Error,
+                );
+                return;
+            };
+
+            let Some(path) = rfd::FileDialog::new()
+                .set_title("Open playlist")
+                .add_filter("OBR Music Tool playlist", &[PLAYLIST_EXT])
+                .pick_file()
+            else {
+                return;
+            };
+
+            let entries = match load_playlist(&path) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    set_status(&app, "Open failed", &e.to_string(), Tone::Error);
+                    append_log(&app, &format!("Playlist error: {}", e));
+                    return;
+                }
+            };
+
+            let mut loaded = 0usize;
+            let mut skipped = Vec::new();
+            {
+                let mut st = state(&shared);
+                for r in st.replacements.iter_mut() {
+                    *r = None;
+                }
+                for (id, source) in entries {
+                    let Some(idx) = WWISE_TRACKS.iter().position(|wt| wt.wwise_id == id) else {
+                        skipped.push(format!("unknown track id {}", id));
+                        continue;
+                    };
+                    if !source.is_file() {
+                        skipped.push(format!(
+                            "{}: file not found: {}",
+                            WWISE_TRACKS[idx].display_name,
+                            source.display()
+                        ));
+                        continue;
+                    }
+                    st.replacements[idx] = Some(source);
+                    loaded += 1;
+                }
+            }
+            refresh_tracks(&app, &shared, &game_root, &model);
+
+            append_log(&app, &format!("Playlist opened: {} ({} track(s))", path.display(), loaded));
+            for s in &skipped {
+                append_log(&app, &format!("Skipped: {}", s));
+            }
+            if skipped.is_empty() {
+                set_status(&app, "Playlist opened", &format!("{} track(s) queued.", loaded), Tone::Success);
+            } else {
+                set_status(
+                    &app,
+                    "Playlist opened",
+                    &format!("{} track(s) queued; {} skipped (see log).", loaded, skipped.len()),
+                    Tone::Warning,
+                );
+            }
+        });
+    }
+
     let ui_sync_timer = Rc::new(Timer::default());
     {
         let weak = app.as_weak();
@@ -1314,5 +1525,35 @@ mod tests {
         assert!(readme.contains("Battle   Battle 01      <- my battle song.mp3"), "{readme}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn playlist_round_trips_and_tolerates_hand_edits() {
+        let mut replacements: Vec<Option<PathBuf>> = vec![None; WWISE_TRACKS.len()];
+        replacements[0] = Some(PathBuf::from(r"C:\songs\battle.mp3"));
+        replacements[27] = Some(PathBuf::from(r"D:\music\win = yes.flac"));
+
+        let text = playlist_text(&replacements);
+        assert!(text.starts_with(PLAYLIST_HEADER), "{text}");
+        assert!(text.contains("# Special / Success"), "{text}");
+        assert_eq!(
+            parse_playlist(&text).unwrap(),
+            vec![
+                (WWISE_TRACKS[0].wwise_id, PathBuf::from(r"C:\songs\battle.mp3")),
+                (WWISE_TRACKS[27].wwise_id, PathBuf::from(r"D:\music\win = yes.flac")),
+            ]
+        );
+
+        // A BOM, stray whitespace and comment lines (e.g. after editing in Notepad) are fine.
+        let edited = format!("\u{feff}{}\r\n  # note\r\n 58019519 =  C:\\x.mp3 \r\n\r\n", PLAYLIST_HEADER);
+        assert_eq!(parse_playlist(&edited).unwrap(), vec![(58019519, PathBuf::from(r"C:\x.mp3"))]);
+    }
+
+    #[test]
+    fn playlist_rejects_foreign_or_broken_files() {
+        assert!(parse_playlist("just some text").is_err());
+        assert!(parse_playlist(&format!("{}\r\nnot-a-number = C:\\x.mp3", PLAYLIST_HEADER)).is_err());
+        assert!(parse_playlist(&format!("{}\r\n58019519 =   ", PLAYLIST_HEADER)).is_err());
+        assert!(parse_playlist(&format!("{}\r\nno separator here", PLAYLIST_HEADER)).is_err());
     }
 }

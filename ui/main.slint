@@ -1,5 +1,6 @@
 import {
     Button,
+    CheckBox,
     ComboBox,
     Palette,
     ScrollView,
@@ -60,6 +61,11 @@ export component AppWindow inherits Window {
     in-out property <string> playing-position-text: "0:00";
     in-out property <string> playing-duration-text: "0:00";
     in-out property <bool> playing-paused: false;
+    // Copyright reminder shown before Export / Package; `pending-export` remembers which one.
+    in-out property <bool> export-warning-visible: false;
+    in-out property <string> pending-export: "";
+    // Set by the backend at startup when the user ticked "Don't show this again" earlier.
+    in-out property <bool> export-warning-dismissed: false;
 
     out property <bool> can-build: !root.build-running
         && root.staged-count > 0;
@@ -76,6 +82,9 @@ export component AppWindow inherits Window {
     callback build-pak();
     callback export-pak();
     callback package-mod();
+    callback save-playlist();
+    callback load-playlist();
+    callback export-warning-dismiss();
     callback restore-staging();
     callback open-kofi();
     callback open-output();
@@ -91,6 +100,23 @@ export component AppWindow inherits Window {
 
     init => {
         Palette.color-scheme = ColorScheme.dark;
+    }
+
+    function run-export(kind: string) {
+        if (kind == "pak") {
+            root.export-pak();
+        } else if (kind == "zip") {
+            root.package-mod();
+        }
+    }
+
+    function request-export(kind: string) {
+        if (root.export-warning-dismissed) {
+            root.run-export(kind);
+        } else {
+            root.pending-export = kind;
+            root.export-warning-visible = true;
+        }
     }
 
     changed log-text => {
@@ -324,6 +350,25 @@ export component AppWindow inherits Window {
                         }
 
                         HorizontalLayout {
+                            height: 32px;
+                            spacing: 8px;
+
+                            Button {
+                                horizontal-stretch: 1;
+                                text: "Open playlist...";
+                                enabled: !root.build-running && root.game-valid;
+                                clicked => { root.load-playlist(); }
+                            }
+
+                            Button {
+                                horizontal-stretch: 1;
+                                text: "Save playlist...";
+                                enabled: root.can-build;
+                                clicked => { root.save-playlist(); }
+                            }
+                        }
+
+                        HorizontalLayout {
                             height: 44px;
                             spacing: 8px;
 
@@ -350,19 +395,19 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 1;
                                 text: "Export PAK";
                                 enabled: root.can-build;
-                                clicked => { root.export-pak(); }
+                                clicked => { root.request-export("pak"); }
                             }
 
                             PrimaryButton {
                                 horizontal-stretch: 1;
                                 text: "Package release ZIP";
                                 enabled: root.can-build;
-                                clicked => { root.package-mod(); }
+                                clicked => { root.request-export("zip"); }
                             }
                         }
 
                         Text {
-                            text: "Build installs into the game. Export saves a loose PAK. Package bundles a ready-to-upload ZIP (PAK in ~mods layout + README); the ZIP file name becomes the mod name.";
+                            text: "Build installs into the game. Export saves a loose PAK. Package bundles a ready-to-upload ZIP (PAK in ~mods layout + README); the ZIP file name becomes the mod name. Playlists remember which file goes on which track, so you can reopen and tweak a mod later.";
                             color: Theme.text-muted;
                             font-size: 11px;
                             wrap: word-wrap;
@@ -807,6 +852,88 @@ export component AppWindow inherits Window {
                                 font-size: 12px;
                                 accessible-label: "Activity log";
                                 placeholder-text: "Activity will appear here.";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Copyright reminder, shown on top of everything before Export / Package.
+    if root.export-warning-visible : Rectangle {
+        background: #000000b0;
+
+        // Swallow clicks so the UI underneath is inert while the warning is up.
+        TouchArea { }
+
+        VerticalLayout {
+            alignment: center;
+
+            HorizontalLayout {
+                alignment: center;
+
+                Rectangle {
+                    width: 560px;
+                    background: Theme.surface;
+                    border-color: Theme.warning;
+                    border-width: 1px;
+                    border-radius: 8px;
+
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 12px;
+
+                        Text {
+                            text: "Before you share this mod";
+                            color: Theme.warning;
+                            font-size: 18px;
+                            font-weight: 650;
+                        }
+
+                        Text {
+                            text: "Be careful when uploading music mods. Only share music you own the copyright to, or that you have explicit permission from the rights holder to redistribute. Sharing copyrighted music can result in takedown notices, account strikes, or legal action against you.";
+                            color: Theme.text-primary;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+
+                        Text {
+                            text: "The developer of OBR Music Tool accepts no responsibility for takedown notices, account actions, or any other legal consequences arising from content you create or distribute with it. By continuing, you confirm that you have the necessary rights.";
+                            color: Theme.text-secondary;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+
+                            dont-show-again := CheckBox {
+                                horizontal-stretch: 1;
+                                text: "Don't show this again";
+                            }
+
+                            Button {
+                                text: "Cancel";
+                                width: 90px;
+                                clicked => {
+                                    root.export-warning-visible = false;
+                                    root.pending-export = "";
+                                }
+                            }
+
+                            PrimaryButton {
+                                text: "I understand, continue";
+                                width: 210px;
+                                clicked => {
+                                    if (dont-show-again.checked) {
+                                        root.export-warning-dismissed = true;
+                                        root.export-warning-dismiss();
+                                    }
+                                    root.export-warning-visible = false;
+                                    root.run-export(root.pending-export);
+                                    root.pending-export = "";
+                                }
                             }
                         }
                     }

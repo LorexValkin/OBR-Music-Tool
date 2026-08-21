@@ -1,0 +1,51 @@
+OBR Music Tool License
+Version 1.0, August 2026
+
+Copyright (c) 2026 Lorex (LorexValkin)
+
+1. Permission
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to use,
+copy, modify, merge, publish and distribute the Software, subject to the
+conditions below.
+
+2. Conditions
+
+  a. Attribution. The above copyright notice and this license must be
+     included in all copies or substantial portions of the Software.
+
+  b. No paywalls. The Software, and any mods or other output created with
+     it, must remain freely available. You may not sell them or place them
+     behind a paywall, early-access tier, subscription, membership,
+     "supporter-only" download, or any other arrangement in which payment is
+     required to obtain or use them. Asking for voluntary donations (for
+     example a Ko-fi, PayPal or Patreon link) is permitted, provided the same
+     files are available to everyone, free of charge, at the same time.
+
+  c. Same terms for forks. Modified versions of the Software must be
+     distributed under this license, including condition 2(b).
+
+3. Your content
+
+The Software does not grant you any rights to the audio you process with it.
+You are solely responsible for ensuring that you own, or have permission to
+use and redistribute, any music you include in a mod. The author accepts no
+responsibility for takedown notices, platform enforcement actions, or legal
+claims arising from content created or distributed with the Software.
+
+4. No warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+5. Third-party software
+
+The Software depends on third-party libraries distributed under their own
+licenses, and drives Audiokinetic Wwise, which is licensed separately by
+Audiokinetic Inc. and is not included. Nothing in this license alters those
+terms.

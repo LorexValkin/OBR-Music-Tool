@@ -16,6 +16,7 @@ no hex editing, no hand-built soundbanks. Everything runs locally on your PC.
   - **Build & install PAK** — writes the pak straight into your game's `Paks` folder. Launch the game and you're done.
   - **Export PAK** — saves a loose `.pak` wherever you like.
   - **Package release ZIP** — produces a ready-to-upload mod archive (pak in the standard `~mods` layout plus a generated `README.txt` listing the replaced tracks). The zip's file name becomes the mod's name.
+- **Saves playlists** — a small `.obrplaylist` file remembers which audio file goes on which track, so you can reopen a mod later, swap a few songs and rebuild without redoing the rest.
 
 > **Scope:** the tool *replaces* the existing 28 tracks. Adding brand-new tracks to the playlist is not supported, because which tracks play (and when) is defined inside the game's Wwise soundbanks, not by the audio files.
 
@@ -81,7 +82,13 @@ You can uninstall Wwise from the Launcher at any time; only the `.wem` conversio
      ```
      That layout installs cleanly through Vortex / MO2 and by extracting into the game folder, so it
      can go straight to Nexus Mods.
+   Export and Package first show a short copyright reminder — only share music you own or have permission
+   to redistribute (see [Legal](#legal)). Tick *Don't show this again* to skip it in future; delete
+   `%LOCALAPPDATA%\OBRMusicTool\export-warning-acknowledged` to bring it back.
 5. **Open output** (in the Activity log header) reveals the finished file in Explorer.
+6. **Save playlist…** to keep your selection. **Open playlist…** restores it later, so you can change a
+   couple of tracks and rebuild. Playlists are plain text (`<wwise id> = <path>` per track), so they can be
+   edited by hand; files that have moved are skipped and listed in the log.
 
 Encoding runs in the background with a progress bar; the Activity log records every step and can be copied
 with one click if you need to report a problem.
@@ -133,6 +140,24 @@ The executable is written to `target\release\obr-music-tool.exe`. Run `cargo tes
 
 Built with [Slint](https://slint.dev) (UI), [repak](https://github.com/trumank/repak) (pak writer),
 [rodio](https://github.com/RustAudio/rodio) (audio decoding and preview) and [zip](https://github.com/zip-rs/zip2).
+
+## Legal
+
+**Music copyright is your responsibility.** This tool only repackages audio you supply. Before uploading a
+music mod anywhere, make sure you own the rights to every track or have explicit permission from the rights
+holder. Distributing copyrighted music can lead to takedown notices, account strikes or legal action, and the
+developer of OBR Music Tool accepts no responsibility for any of that.
+
+## License
+
+OBR Music Tool is **free to use, modify and share** under the [OBR Music Tool License](LICENSE). The short
+version:
+
+- **No paywalls.** Neither the tool nor any mod made with it may be sold or locked behind a paywall,
+  early-access tier, subscription or "supporter-only" download.
+- **Donations are fine.** Ko-fi / PayPal / Patreon links are welcome, as long as the same files are available
+  to everyone for free at the same time.
+- **Forks keep the same terms**, and the usual attribution and no-warranty clauses apply.
 
 ## Support
 
