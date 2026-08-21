@@ -4,7 +4,7 @@ Replace the music in **The Elder Scrolls IV: Oblivion Remastered** with your own
 Pick a song for any of the game's 28 music tracks, click one button, and play — no Unreal Engine,
 no hex editing, no hand-built soundbanks. Everything runs locally on your PC.
 
-![OBR Music Tool](docs/screenshot.png)
+![OBR Music Tool](docs/obr-music-tool.png)
 
 ## What it does
 
