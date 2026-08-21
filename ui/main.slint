@@ -1,0 +1,738 @@
+import {
+    Button,
+    ComboBox,
+    Palette,
+    ScrollView,
+    TextEdit
+} from "std-widgets.slint";
+
+import { Theme } from "theme.slint";
+import { PathField } from "components/PathField.slint";
+import { PrimaryButton } from "components/PrimaryButton.slint";
+import { DangerButton } from "components/DangerButton.slint";
+import { StatusLine } from "components/StatusLine.slint";
+import { SupportCredit } from "components/SupportCredit.slint";
+
+export struct TrackEntry {
+    category: string,
+    filename: string,
+    size: string,
+    status: string,
+}
+
+export component AppWindow inherits Window {
+    title: "OBR Music Tool";
+    preferred-width: 1200px;
+    preferred-height: 850px;
+    min-width: 1000px;
+    min-height: 720px;
+
+    in-out property <string> application-version: "";
+    in-out property <string> game-path: "";
+    in-out property <bool> game-valid: false;
+    in-out property <string> game-status: "Choose the Oblivion Remastered installation folder.";
+    in-out property <int> game-tone: 0;
+
+    in-out property <[TrackEntry]> track-list: [];
+    in-out property <int> staged-count: 0;
+    in-out property <int> vanilla-count: 0;
+
+    in-out property <string> status-title: "Ready";
+    in-out property <string> status-message: "Choose a game folder, then add or replace music tracks.";
+    in-out property <int> status-tone: 0;
+    in-out property <string> log-text: "";
+    in-out property <bool> build-running: false;
+    in-out property <bool> build-complete: false;
+    in-out property <string> output-path: "";
+    in-out property <string> add-category: "Explore";
+    in-out property <int> playing-index: -1;
+    in-out property <string> playing-filename: "";
+    in-out property <float> playing-progress: 0;
+    in-out property <string> playing-position-text: "0:00";
+    in-out property <string> playing-duration-text: "0:00";
+    in-out property <bool> playing-paused: false;
+
+    out property <bool> can-build: !root.build-running
+        && root.staged-count > 0;
+    out property <bool> can-restore: !root.build-running
+        && root.staged-count > 0;
+    out property <bool> is-playing: root.playing-index >= 0;
+
+    callback choose-game-folder();
+    callback find-game();
+    callback game-path-edited();
+    callback replace-track(int);
+    callback remove-staged(int);
+    callback add-track();
+    callback build-pak();
+    callback restore-staging();
+    callback open-kofi();
+    callback open-output();
+    callback copy-log();
+    callback play-track(int);
+    callback stop-playback();
+    callback toggle-pause();
+    callback seek-to(float);
+
+    background: Theme.window-background;
+
+    init => {
+        Palette.color-scheme = ColorScheme.dark;
+    }
+
+    changed log-text => {
+        if (!live-log.has-focus) {
+            live-log.viewport-y = min(0px, live-log.visible-height - live-log.viewport-height);
+        }
+    }
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        Rectangle {
+            height: 68px;
+            vertical-stretch: 0;
+            background: Theme.chrome-background;
+            border-color: Theme.border;
+            border-width: 1px;
+            border-radius: 7px;
+
+            HorizontalLayout {
+                padding-left: 18px;
+                padding-right: 18px;
+                spacing: 20px;
+
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    spacing: 2px;
+
+                    Text {
+                        text: "OBR Music Tool";
+                        color: Theme.text-primary;
+                        font-size: 23px;
+                        font-weight: 700;
+                    }
+
+                    Text {
+                        text: "Replace and add music tracks for Oblivion Remastered";
+                        color: Theme.text-muted;
+                        font-size: 12px;
+                    }
+                }
+
+                VerticalLayout {
+                    width: 240px;
+                    alignment: center;
+                    spacing: 4px;
+
+                    Text {
+                        text: "VERSION " + root.application-version;
+                        color: Theme.text-muted;
+                        font-size: 11px;
+                        font-weight: 600;
+                        horizontal-alignment: right;
+                    }
+
+                    StatusLine {
+                        align-end: true;
+                        text: root.build-running ? "Building pak"
+                            : root.game-valid ? "Game connected"
+                            : "Setup required";
+                        tone: root.build-running ? 2 : root.game-valid ? 1 : 0;
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 12px;
+            vertical-stretch: 1;
+
+            Rectangle {
+                width: 420px;
+                horizontal-stretch: 0;
+                background: Theme.surface;
+                border-color: Theme.border;
+                border-width: 1px;
+                border-radius: 7px;
+
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 10px;
+
+                    VerticalLayout {
+                        min-height: 44px;
+                        max-height: 44px;
+                        vertical-stretch: 0;
+                        spacing: 2px;
+
+                        Text {
+                            text: "Setup";
+                            color: Theme.text-primary;
+                            font-size: 18px;
+                            font-weight: 650;
+                        }
+
+                        Text {
+                            text: "Point to the game, then stage your tracks.";
+                            color: Theme.text-muted;
+                            font-size: 12px;
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        vertical-stretch: 0;
+                        background: Theme.border;
+                    }
+
+                    VerticalLayout {
+                        min-height: 86px;
+                        max-height: 86px;
+                        vertical-stretch: 0;
+                        spacing: 4px;
+
+                        PathField {
+                            label: "GAME INSTALLATION";
+                            placeholder: "Oblivion Remastered folder";
+                            primary-action: "Find game";
+                            primary-width: 86px;
+                            value <=> root.game-path;
+                            enabled: !root.build-running;
+                            primary-clicked => { root.find-game(); }
+                            edited => { root.game-path-edited(); }
+                        }
+
+                        StatusLine {
+                            text: root.game-status;
+                            tone: root.game-tone;
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        vertical-stretch: 0;
+                        background: Theme.border;
+                    }
+
+                    VerticalLayout {
+                        spacing: 6px;
+                        vertical-stretch: 0;
+
+                        Text {
+                            text: "ADD NEW TRACK";
+                            color: Theme.text-secondary;
+                            font-size: 12px;
+                            font-weight: 600;
+                        }
+
+                        HorizontalLayout {
+                            height: 40px;
+                            spacing: 8px;
+
+                            ComboBox {
+                                width: 120px;
+                                model: ["Battle", "Dungeon", "Explore", "Public", "Special"];
+                                current-value <=> root.add-category;
+                                enabled: !root.build-running && root.game-valid;
+                            }
+
+                            PrimaryButton {
+                                horizontal-stretch: 1;
+                                text: "Add MP3";
+                                enabled: !root.build-running && root.game-valid;
+                                clicked => { root.add-track(); }
+                            }
+                        }
+
+                        Text {
+                            text: "Adds a new track to the selected category rotation.";
+                            color: Theme.text-muted;
+                            font-size: 11px;
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        vertical-stretch: 0;
+                        background: Theme.border;
+                    }
+
+                    VerticalLayout {
+                        spacing: 6px;
+                        vertical-stretch: 0;
+
+                        Text {
+                            text: "STAGING";
+                            color: Theme.text-secondary;
+                            font-size: 12px;
+                            font-weight: 600;
+                        }
+
+                        Text {
+                            text: root.staged-count == 0
+                                ? "No tracks staged."
+                                : root.staged-count == 1
+                                    ? "1 track staged for packaging."
+                                    : root.staged-count + " tracks staged for packaging.";
+                            color: root.staged-count > 0 ? Theme.success : Theme.text-muted;
+                            font-size: 12px;
+                        }
+
+                        HorizontalLayout {
+                            height: 44px;
+                            spacing: 8px;
+
+                            PrimaryButton {
+                                horizontal-stretch: 1;
+                                text: root.build-running ? "Building..." : "Build PAK";
+                                enabled: root.can-build;
+                                clicked => { root.build-pak(); }
+                            }
+
+                            DangerButton {
+                                width: 100px;
+                                text: "Clear all";
+                                enabled: root.can-restore;
+                                clicked => { root.restore-staging(); }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: transparent;
+                    }
+
+                    HorizontalLayout {
+                        height: 20px;
+                        vertical-stretch: 0;
+                        spacing: 12px;
+
+                        Text {
+                            horizontal-stretch: 1;
+                            text: "All operations run locally on this computer.";
+                            color: Theme.text-muted;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+
+                        SupportCredit {
+                            clicked => { root.open-kofi(); }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+                background: Theme.surface;
+                border-color: Theme.border;
+                border-width: 1px;
+                border-radius: 7px;
+
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+
+                    HorizontalLayout {
+                        height: 60px;
+                        vertical-stretch: 0;
+                        spacing: 16px;
+
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            spacing: 3px;
+
+                            Text {
+                                text: root.status-title;
+                                color: root.status-tone == 1 ? Theme.success
+                                    : root.status-tone == 2 ? Theme.warning
+                                    : root.status-tone == 3 ? Theme.danger
+                                    : Theme.text-primary;
+                                font-size: 19px;
+                                font-weight: 650;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                text: root.status-message;
+                                color: Theme.text-secondary;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "TRACK INVENTORY";
+                        color: Theme.text-secondary;
+                        font-size: 12px;
+                        font-weight: 600;
+                    }
+
+                    Rectangle {
+                        height: 28px;
+                        vertical-stretch: 0;
+                        background: Theme.surface-muted;
+                        border-color: Theme.border;
+                        border-width: 1px;
+                        border-radius: 4px;
+
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            spacing: 8px;
+
+                            Text {
+                                width: 80px;
+                                text: "Category";
+                                color: Theme.text-muted;
+                                font-size: 11px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "Filename";
+                                color: Theme.text-muted;
+                                font-size: 11px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                width: 70px;
+                                text: "Size";
+                                color: Theme.text-muted;
+                                font-size: 11px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
+                            }
+                            Text {
+                                width: 80px;
+                                text: "Status";
+                                color: Theme.text-muted;
+                                font-size: 11px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
+                            }
+                            Rectangle {
+                                width: 120px;
+                            }
+                        }
+                    }
+
+                    ScrollView {
+                        vertical-stretch: 1;
+
+                        VerticalLayout {
+                            spacing: 2px;
+
+                            for entry[index] in root.track-list : Rectangle {
+                                height: 32px;
+                                background: touch-row.has-hover ? Theme.surface-raised : transparent;
+                                border-radius: 3px;
+
+                                touch-row := TouchArea {}
+
+                                HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    spacing: 8px;
+
+                                    Text {
+                                        width: 80px;
+                                        text: entry.category;
+                                        color: Theme.text-secondary;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: entry.filename;
+                                        color: root.playing-index == index ? Theme.success : Theme.text-primary;
+                                        font-size: 12px;
+                                        font-family: "Consolas";
+                                        font-weight: root.playing-index == index ? 700 : 400;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+
+                                    Text {
+                                        width: 70px;
+                                        text: entry.size;
+                                        color: Theme.text-muted;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: right;
+                                    }
+
+                                    Text {
+                                        width: 80px;
+                                        text: entry.status;
+                                        color: entry.status == "vanilla" ? Theme.text-muted
+                                            : entry.status == "replace" ? Theme.warning
+                                            : Theme.success;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: right;
+                                    }
+
+                                    Rectangle {
+                                        width: 120px;
+                                        horizontal-stretch: 0;
+
+                                        HorizontalLayout {
+                                            spacing: 4px;
+                                            alignment: end;
+
+                                            Button {
+                                                text: root.playing-index == index ? "Stop" : "Play";
+                                                width: 50px;
+                                                height: 26px;
+                                                clicked => {
+                                                    if (root.playing-index == index) {
+                                                        root.stop-playback();
+                                                    } else {
+                                                        root.play-track(index);
+                                                    }
+                                                }
+                                            }
+
+                                            if entry.status == "vanilla" : Button {
+                                                text: "Replace";
+                                                width: 66px;
+                                                height: 26px;
+                                                enabled: !root.build-running;
+                                                clicked => { root.replace-track(index); }
+                                            }
+
+                                            if entry.status != "vanilla" : Button {
+                                                text: "Remove";
+                                                width: 66px;
+                                                height: 26px;
+                                                enabled: !root.build-running;
+                                                clicked => { root.remove-staged(index); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if root.is-playing : Rectangle {
+                        height: 72px;
+                        vertical-stretch: 0;
+                        background: Theme.surface-muted;
+                        border-color: Theme.border;
+                        border-width: 1px;
+                        border-radius: 6px;
+
+                        VerticalLayout {
+                            padding: 12px;
+                            padding-top: 10px;
+                            padding-bottom: 10px;
+                            spacing: 8px;
+
+                            HorizontalLayout {
+                                height: 28px;
+                                vertical-stretch: 0;
+                                spacing: 8px;
+
+                                // Pause / Play button
+                                Rectangle {
+                                    width: 32px;
+                                    height: 28px;
+                                    horizontal-stretch: 0;
+                                    border-radius: 5px;
+                                    background: pause-touch.pressed ? Theme.action-pressed
+                                        : pause-touch.has-hover ? Theme.action-hover
+                                        : Theme.action;
+                                    border-width: 1px;
+                                    border-color: Theme.action-border;
+
+                                    if root.playing-paused : Path {
+                                        x: 12px;
+                                        y: 7px;
+                                        width: 12px;
+                                        height: 14px;
+                                        fill: #ffffff;
+                                        commands: "M 0 0 L 12 7 L 0 14 Z";
+                                    }
+
+                                    if !root.playing-paused : HorizontalLayout {
+                                        padding-left: 9px;
+                                        padding-right: 9px;
+                                        padding-top: 6px;
+                                        padding-bottom: 6px;
+                                        spacing: 3px;
+
+                                        Rectangle {
+                                            width: 4px;
+                                            background: #ffffff;
+                                            border-radius: 1px;
+                                        }
+                                        Rectangle {
+                                            width: 4px;
+                                            background: #ffffff;
+                                            border-radius: 1px;
+                                        }
+                                    }
+
+                                    pause-touch := TouchArea {
+                                        clicked => { root.toggle-pause(); }
+                                    }
+                                }
+
+                                // Stop button
+                                Rectangle {
+                                    width: 32px;
+                                    height: 28px;
+                                    horizontal-stretch: 0;
+                                    border-radius: 5px;
+                                    background: stop-touch.pressed ? Theme.danger-action-pressed
+                                        : stop-touch.has-hover ? Theme.danger-action-hover
+                                        : Theme.danger-action;
+                                    border-width: 1px;
+                                    border-color: Theme.danger-border;
+
+                                    Rectangle {
+                                        x: 10px;
+                                        y: 8px;
+                                        width: 12px;
+                                        height: 12px;
+                                        background: #ffffff;
+                                        border-radius: 2px;
+                                    }
+
+                                    stop-touch := TouchArea {
+                                        clicked => { root.stop-playback(); }
+                                    }
+                                }
+
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: root.playing-filename;
+                                    color: Theme.success;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    font-family: "Consolas";
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+
+                                Text {
+                                    text: root.playing-position-text + " / " + root.playing-duration-text;
+                                    color: Theme.text-secondary;
+                                    font-size: 12px;
+                                    font-family: "Consolas";
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: right;
+                                }
+                            }
+
+                            Rectangle {
+                                height: 14px;
+                                vertical-stretch: 0;
+                                background: Theme.surface-raised;
+                                border-color: Theme.border;
+                                border-width: 1px;
+                                border-radius: 7px;
+
+                                Rectangle {
+                                    x: 1px;
+                                    y: 1px;
+                                    width: max(0px, (parent.width - 2px) * root.playing-progress);
+                                    height: parent.height - 2px;
+                                    background: Theme.success;
+                                    border-radius: 6px;
+                                }
+
+                                Rectangle {
+                                    x: max(1px, (parent.width - 2px) * root.playing-progress - 6px);
+                                    y: -2px;
+                                    width: 18px;
+                                    height: 18px;
+                                    border-radius: 9px;
+                                    background: #ffffff;
+                                    border-color: Theme.success;
+                                    border-width: 2px;
+                                    visible: root.playing-progress > 0.001;
+                                }
+
+                                seek-area := TouchArea {
+                                    clicked => {
+                                        root.seek-to(self.mouse-x / self.width);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        min-height: 160px;
+                        max-height: 200px;
+                        vertical-stretch: 0;
+                        background: Theme.terminal;
+                        border-color: Theme.border;
+                        border-width: 1px;
+                        border-radius: 6px;
+
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 6px;
+
+                            HorizontalLayout {
+                                height: 28px;
+                                vertical-stretch: 0;
+                                spacing: 10px;
+
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: "Activity log";
+                                    color: Theme.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                }
+
+                                Button {
+                                    text: "Copy";
+                                    width: 62px;
+                                    enabled: root.log-text != "";
+                                    clicked => { root.copy-log(); }
+                                }
+
+                                if root.build-complete : Button {
+                                    text: "Open output";
+                                    width: 100px;
+                                    clicked => { root.open-output(); }
+                                }
+                            }
+
+                            live-log := TextEdit {
+                                vertical-stretch: 1;
+                                text: root.log-text;
+                                read-only: true;
+                                wrap: word-wrap;
+                                font-size: 12px;
+                                accessible-label: "Activity log";
+                                placeholder-text: "Activity will appear here.";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

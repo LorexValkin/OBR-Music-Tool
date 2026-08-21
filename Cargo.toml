@@ -1,0 +1,33 @@
+[package]
+name = "obr-music-tool"
+version = "0.1.0"
+edition = "2021"
+description = "Replace and add music tracks for Oblivion Remastered"
+publish = false
+default-run = "obr-music-tool"
+
+[[bin]]
+name = "obr-music-tool"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+arboard = "3"
+repak = { git = "https://github.com/trumank/repak", features = ["compression", "oodle"] }
+rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
+mp3-duration = "0.1"
+rodio = { version = "0.20", default-features = false, features = ["mp3", "vorbis", "flac", "wav"] }
+slint = { version = "=1.12.1", default-features = false, features = ["accessibility", "backend-winit", "compat-1-2", "renderer-femtovg", "std"] }
+walkdir = "2"
+winreg = "0.56"
+
+[build-dependencies]
+slint-build = "=1.12.1"
+winresource = { version = "0.1", default-features = false }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "s"
+panic = "abort"
+strip = "symbols"
