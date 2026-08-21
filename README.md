@@ -82,8 +82,8 @@ You can uninstall Wwise from the Launcher at any time; only the `.wem` conversio
      ```
      That layout installs cleanly through Vortex / MO2 and by extracting into the game folder, so it
      can go straight to Nexus Mods.
-   Export and Package first show a short copyright reminder — only share music you own or have permission
-   to redistribute (see [Legal](#legal)). Tick *Don't show this again* to skip it in future; delete
+   Export and Package first show a short copyright reminder — only share music you own, have permission to
+   redistribute, or that is free to use (see [Legal](#legal)). Tick *Don't show this again* to skip it in future; delete
    `%LOCALAPPDATA%\OBRMusicTool\export-warning-acknowledged` to bring it back.
 5. **Open output** (in the Activity log header) reveals the finished file in Explorer.
 6. **Save playlist…** to keep your selection. **Open playlist…** restores it later, so you can change a
@@ -144,9 +144,15 @@ Built with [Slint](https://slint.dev) (UI), [repak](https://github.com/trumank/r
 ## Legal
 
 **Music copyright is your responsibility.** This tool only repackages audio you supply. Before uploading a
-music mod anywhere, make sure you own the rights to every track or have explicit permission from the rights
-holder. Distributing copyrighted music can lead to takedown notices, account strikes or legal action, and the
-developer of OBR Music Tool accepts no responsibility for any of that.
+music mod anywhere, make sure every track is one of the following:
+
+- your own work,
+- music the rights holder has explicitly allowed you to redistribute, or
+- music that is free to use — royalty-free, Creative Commons, public domain or a similar open license
+  (read the terms; many require you to credit the artist).
+
+Distributing copyrighted music without permission can lead to takedown notices, account strikes or legal
+action, and the developer of OBR Music Tool accepts no responsibility for any of that.
 
 ## License
 
