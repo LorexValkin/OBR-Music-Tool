@@ -4,7 +4,7 @@ Replace the music in **The Elder Scrolls IV: Oblivion Remastered** with your own
 Pick a song for any of the game's 28 music tracks, click one button, and play. No Unreal Engine,
 no hex editing, no hand-built soundbanks. Everything runs locally on your PC.
 
-![OBR Music Tool](docs/obr-music-tool.png)
+![OBR Music Tool](docs/screenshot-2026-08-21.png)
 
 ## What it does
 
@@ -18,7 +18,7 @@ no hex editing, no hand-built soundbanks. Everything runs locally on your PC.
   - **Package release ZIP**: produces a ready-to-upload mod archive (pak in the standard `~mods` layout plus a generated `README.txt` listing the replaced tracks). The zip's file name becomes the mod's name.
 - **Saves playlists**: a small `.obrplaylist` file remembers which audio file goes on which track, so you can reopen a mod later, swap a few songs and rebuild without redoing the rest.
 
-> **Scope:** the tool *replaces* the existing 28 tracks. Adding brand-new tracks to the playlist is not supported, because which tracks play (and when) is defined inside the game's Wwise soundbanks, not by the audio files.
+> **Scope:** the tool *replaces* the existing 28 tracks. Adding brand-new tracks to the playlist is not supported, because which tracks play (and when) is defined inside the game's Wwise soundbanks, not by the audio files. Future updates will attempt to add support for adding more music to the playlist.
 
 ## Requirements
 
