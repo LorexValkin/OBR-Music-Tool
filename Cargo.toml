@@ -1,6 +1,6 @@
 [package]
 name = "obr-music-tool"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
 description = "Replace and add music tracks for Oblivion Remastered"
 license-file = "LICENSE"
