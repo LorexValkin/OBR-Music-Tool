@@ -1,10 +1,10 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![windows_subsystem = "windows"]
 
 use anyhow::{Context, Result, bail};
 use rodio::{Decoder, OutputStream, Sink, Source};
-use slint::{ComponentHandle, Timer, TimerMode};
+use slint::{ComponentHandle, Model, Timer, TimerMode};
 use std::fs;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -14,6 +14,8 @@ use std::time::Duration;
 mod iostore;
 mod wem;
 mod wem_encoder;
+
+use wem_encoder::find_wwise_cli;
 
 slint::include_modules!();
 
@@ -246,6 +248,7 @@ fn tracks_to_model(tracks: &[TrackInfo]) -> slint::ModelRc<TrackEntry> {
                 TrackStatus::Added => "added",
             }
             .into(),
+            replacement: Default::default(),
         })
         .collect();
     slint::ModelRc::new(slint::VecModel::from(entries))
@@ -364,6 +367,301 @@ fn format_time(secs: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Release packaging
+// ---------------------------------------------------------------------------
+
+/// File name used when building straight into the game's Paks folder.
+const INSTALL_PAK_NAME: &str = "zzz_MusicMod_P.pak";
+/// Where the PAK lives inside a release ZIP - the layout Vortex/MO2 and manual installs expect.
+const RELEASE_PAK_DIR: &str = "OblivionRemastered/Content/Paks/~mods";
+
+/// Appends `.ext` if the path does not already end with it (case-insensitive).
+fn ensure_extension(mut path: PathBuf, ext: &str) -> PathBuf {
+    let has_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext));
+    if !has_ext {
+        path.as_mut_os_string().push(format!(".{}", ext));
+    }
+    path
+}
+
+/// Derives the mod name from the ZIP the user chose: `My Music.zip` -> `My Music`.
+fn mod_name_from_path(zip_path: &Path) -> String {
+    let stem = zip_path.file_stem().unwrap_or_default().to_string_lossy();
+    let mut name = stem.trim();
+    // Avoid `Foo_P_P.pak` if the user already typed the suffix.
+    if let Some(stripped) = name.strip_suffix("_P").or_else(|| name.strip_suffix("_p")) {
+        name = stripped;
+    }
+    let name = name.trim_end_matches(['_', '-', ' ']);
+    if name.is_empty() {
+        "MusicMod".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn release_readme(mod_name: &str, pak_name: &str, included: &[(usize, PathBuf)]) -> String {
+    let pak_rel = format!("{}\\{}", RELEASE_PAK_DIR.replace('/', "\\"), pak_name);
+    let mut lines: Vec<String> = vec![
+        mod_name.to_string(),
+        "=".repeat(mod_name.chars().count()),
+        String::new(),
+        "Music replacement mod for The Elder Scrolls IV: Oblivion Remastered.".to_string(),
+        format!("Created with OBR Music Tool v{}.", VERSION),
+        String::new(),
+        "INSTALLATION".to_string(),
+        "  Mod manager (Vortex / MO2): install this archive like any other mod.".to_string(),
+        "  Manual: extract the archive into your game folder (the one that contains".to_string(),
+        "  \"OblivionRemastered\" and \"Engine\") so the PAK ends up at:".to_string(),
+        format!("    {}", pak_rel),
+        String::new(),
+        "UNINSTALL".to_string(),
+        format!("  Delete {}", pak_rel),
+        String::new(),
+        format!("REPLACED TRACKS ({})", included.len()),
+    ];
+    for (idx, source) in included {
+        let wt = &WWISE_TRACKS[*idx];
+        let src = source.file_name().unwrap_or_default().to_string_lossy();
+        lines.push(format!("  {:<8} {:<14} <- {}", wt.category, wt.display_name, src));
+    }
+    lines.push(String::new());
+    lines.push("Only the tracks listed above are changed; everything else stays vanilla.".to_string());
+    lines.push(String::new());
+    lines.join("\r\n")
+}
+
+/// Writes a release-ready ZIP: the PAK in the `~mods` layout plus a README.
+fn write_release_zip(
+    zip_path: &Path,
+    mod_name: &str,
+    pak_path: &Path,
+    included: &[(usize, PathBuf)],
+) -> Result<()> {
+    let file = fs::File::create(zip_path)
+        .with_context(|| format!("creating {}", zip_path.display()))?;
+    let mut zip = zip::ZipWriter::new(BufWriter::new(file));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    let pak_name = pak_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    zip.start_file(format!("{}/{}", RELEASE_PAK_DIR, pak_name), options)?;
+    let mut pak = fs::File::open(pak_path)
+        .with_context(|| format!("reading {}", pak_path.display()))?;
+    std::io::copy(&mut pak, &mut zip).context("writing PAK into ZIP")?;
+
+    zip.start_file("README.txt", options)?;
+    zip.write_all(release_readme(mod_name, &pak_name, included).as_bytes())?;
+
+    zip.finish().context("finalizing ZIP")?.flush()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Build pipeline (shared by Build / Export / Package)
+// ---------------------------------------------------------------------------
+
+enum BuildTarget {
+    /// Build the PAK straight into the game's Paks folder.
+    Install,
+    /// Save a loose PAK wherever the user chose.
+    ExportPak(PathBuf),
+    /// Bundle a release-ready ZIP (PAK in the `~mods` layout + README).
+    Package { zip_path: PathBuf, mod_name: String },
+}
+
+impl BuildTarget {
+    fn verb(&self) -> &'static str {
+        match self {
+            BuildTarget::Install => "Build",
+            BuildTarget::ExportPak(_) => "Export",
+            BuildTarget::Package { .. } => "Package",
+        }
+    }
+
+    fn progress_label(&self) -> &'static str {
+        match self {
+            BuildTarget::Install => "Building",
+            BuildTarget::ExportPak(_) => "Exporting",
+            BuildTarget::Package { .. } => "Packaging",
+        }
+    }
+}
+
+fn queued_replacements(shared: &SharedState) -> Vec<(usize, PathBuf)> {
+    state(shared)
+        .replacements
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.as_ref().map(|p| (i, p.clone())))
+        .collect()
+}
+
+/// Encodes every queued replacement to WEM on a worker thread, then produces
+/// the requested output. UI state is updated back on the event loop.
+fn start_build(app: &AppWindow, shared: &SharedState, target: BuildTarget) {
+    let replacements = queued_replacements(shared);
+    if replacements.is_empty() {
+        set_status(
+            app,
+            &format!("Nothing to {}", target.verb().to_lowercase()),
+            "No tracks queued.",
+            Tone::Error,
+        );
+        return;
+    }
+
+    let output_path = match &target {
+        BuildTarget::Install => {
+            let Some(game_root) = state(shared).game_root.clone() else {
+                set_status(
+                    app,
+                    "No game folder",
+                    "Connect the game folder first, or use Export / Package instead.",
+                    Tone::Error,
+                );
+                return;
+            };
+            let paks_dir = game_root.join(PAKS_REL);
+            if !paks_dir.is_dir() {
+                set_status(
+                    app,
+                    "Paks folder missing",
+                    &format!("{} does not exist.", paks_dir.display()),
+                    Tone::Error,
+                );
+                return;
+            }
+            paks_dir.join(INSTALL_PAK_NAME)
+        }
+        BuildTarget::ExportPak(path) => path.clone(),
+        BuildTarget::Package { zip_path, .. } => zip_path.clone(),
+    };
+
+    app.set_build_running(true);
+    app.set_build_complete(false);
+    app.set_encoding_active(true);
+    app.set_encoding_progress(0.0);
+    set_status(
+        app,
+        target.progress_label(),
+        &format!("Encoding {} track(s)...", replacements.len()),
+        Tone::Warning,
+    );
+    append_log(app, &format!("--- {} started ---", target.progress_label()));
+
+    let weak = app.as_weak();
+    std::thread::spawn(move || {
+        let total = replacements.len();
+        let staging = staging_dir();
+        let _ = fs::create_dir_all(&staging);
+        let mut errors = Vec::new();
+        let mut encoded: Vec<(usize, PathBuf)> = Vec::new();
+
+        for (step, (idx, source)) in replacements.iter().enumerate() {
+            let wt = &WWISE_TRACKS[*idx];
+            let dest = staging.join(format!("{}.wem", wt.wwise_id));
+
+            let progress = (step as f32 + 0.5) / total as f32;
+            let label = source.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let weak_p = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(app) = weak_p.upgrade() else { return };
+                app.set_encoding_progress(progress);
+                app.set_encoding_file(label.into());
+            });
+
+            let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            let result = if ext == "wem" {
+                fs::copy(source, &dest).map(|_| ()).map_err(anyhow::Error::from)
+            } else {
+                wem::convert_to_wem(source, &dest)
+            };
+
+            match result {
+                Ok(()) => encoded.push((*idx, source.clone())),
+                Err(e) => errors.push(format!("{}: {}", wt.display_name, e)),
+            }
+        }
+
+        let staged_files = collect_staged_wem_files(&staging);
+        let result = if staged_files.is_empty() {
+            Err(anyhow::anyhow!("No WEM files produced"))
+        } else {
+            match &target {
+                BuildTarget::Install | BuildTarget::ExportPak(_) => {
+                    build_pak(&output_path, &staged_files)
+                }
+                BuildTarget::Package { zip_path, mod_name } => {
+                    let pak_path = staging.join(format!("{}_P.pak", mod_name));
+                    build_pak(&pak_path, &staged_files)
+                        .and_then(|()| write_release_zip(zip_path, mod_name, &pak_path, &encoded))
+                }
+            }
+        };
+
+        let _ = clear_staging();
+
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(app) = weak.upgrade() else { return };
+            app.set_build_running(false);
+            app.set_encoding_active(false);
+            app.set_encoding_progress(0.0);
+
+            for err in &errors {
+                append_log(&app, &format!("Error: {}", err));
+            }
+
+            match result {
+                Ok(()) => {
+                    let sz = fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+                    let name = output_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    app.set_output_path(output_path.to_string_lossy().to_string().into());
+                    app.set_build_complete(true);
+
+                    let (title, mut message) = match &target {
+                        BuildTarget::Install => (
+                            "Build complete",
+                            format!("{} ({}) installed to game.", name, human_size(sz)),
+                        ),
+                        BuildTarget::ExportPak(_) => (
+                            "Exported",
+                            format!("Saved {} ({}).", name, human_size(sz)),
+                        ),
+                        BuildTarget::Package { .. } => (
+                            "Packaged",
+                            format!("{} ({}) is ready to upload.", name, human_size(sz)),
+                        ),
+                    };
+                    let tone = if errors.is_empty() {
+                        Tone::Success
+                    } else {
+                        message.push_str(&format!(
+                            " {} track(s) failed to encode and were left out; see log.",
+                            errors.len()
+                        ));
+                        Tone::Warning
+                    };
+                    set_status(&app, title, &message, tone);
+                    append_log(
+                        &app,
+                        &format!("{}: {} ({})", title, output_path.display(), human_size(sz)),
+                    );
+                }
+                Err(e) => {
+                    let title = format!("{} failed", target.verb());
+                    set_status(&app, &title, &e.to_string(), Tone::Error);
+                    append_log(&app, &format!("{}: {}", title, e));
+                }
+            }
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
 // GUI
 // ---------------------------------------------------------------------------
 
@@ -384,8 +682,8 @@ struct AudioPlayer {
 
 struct AppState {
     game_root: Option<PathBuf>,
-    last_output: Option<PathBuf>,
     track_paths: Vec<Option<PathBuf>>,
+    replacements: Vec<Option<PathBuf>>,
     audio: Option<AudioPlayer>,
 }
 
@@ -410,27 +708,49 @@ fn append_log(app: &AppWindow, line: &str) {
     app.set_log_text(log.into());
 }
 
-fn refresh_tracks(app: &AppWindow, shared: &SharedState, game_root: &Path) {
+fn refresh_tracks(app: &AppWindow, shared: &SharedState, game_root: &Path, model: &slint::VecModel<TrackEntry>) {
     let tracks = scan_tracks(game_root);
-
-    let staged = tracks
-        .iter()
-        .filter(|t| t.status != TrackStatus::Vanilla)
-        .count();
-    let vanilla = tracks
-        .iter()
-        .filter(|t| t.status == TrackStatus::Vanilla)
-        .count();
-
     let paths: Vec<Option<PathBuf>> = tracks.iter().map(|t| t.disk_path.clone()).collect();
-    state(shared).track_paths = paths;
 
-    app.set_track_list(tracks_to_model(&tracks));
-    app.set_staged_count(staged as i32);
-    app.set_vanilla_count(vanilla as i32);
+    let mut st = state(shared);
+    st.track_paths = paths;
+    let replacements = st.replacements.clone();
+    drop(st);
+
+    sync_track_model(app, &tracks, &replacements, model);
 }
 
-fn try_connect_game(app: &AppWindow, shared: &SharedState, path: &str) {
+fn sync_track_model(app: &AppWindow, tracks: &[TrackInfo], replacements: &[Option<PathBuf>], model: &slint::VecModel<TrackEntry>) {
+    while model.row_count() > 0 {
+        model.remove(0);
+    }
+    for (i, t) in tracks.iter().enumerate() {
+        let replacement = replacements.get(i).and_then(|r| r.as_ref());
+        let (status_str, size_str, repl_str) = if let Some(src) = replacement {
+            let name = src.file_name().unwrap_or_default().to_string_lossy().to_string();
+            ("replace".to_string(), String::new(), name)
+        } else {
+            let size = match t.size {
+                Some(bytes) => human_size(bytes),
+                None => "packed".to_string(),
+            };
+            ("vanilla".to_string(), size, String::new())
+        };
+        model.push(TrackEntry {
+            category: t.category.clone().into(),
+            filename: t.filename.clone().into(),
+            size: size_str.into(),
+            status: status_str.into(),
+            replacement: repl_str.into(),
+        });
+    }
+
+    let staged = replacements.iter().filter(|r| r.is_some()).count();
+    app.set_staged_count(staged as i32);
+    app.set_vanilla_count((WWISE_TRACKS.len() - staged) as i32);
+}
+
+fn try_connect_game(app: &AppWindow, shared: &SharedState, path: &str, model: &slint::VecModel<TrackEntry>) {
     let path = Path::new(path);
     match validate_game_install(path) {
         Some(root) => {
@@ -440,7 +760,7 @@ fn try_connect_game(app: &AppWindow, shared: &SharedState, path: &str) {
             app.set_game_tone(Tone::Success as i32);
             app.set_game_path(root.to_string_lossy().to_string().into());
             append_log(app, &format!("Connected to: {}", root.display()));
-            refresh_tracks(app, shared, &root);
+            refresh_tracks(app, shared, &root, model);
             set_status(
                 app,
                 "Connected",
@@ -456,9 +776,7 @@ fn try_connect_game(app: &AppWindow, shared: &SharedState, path: &str) {
             app.set_game_valid(false);
             app.set_game_status("Music directory not found at that path.".into());
             app.set_game_tone(Tone::Error as i32);
-            app.set_track_list(slint::ModelRc::new(slint::VecModel::from(
-                Vec::<TrackEntry>::new(),
-            )));
+            while model.row_count() > 0 { model.remove(0); }
             app.set_staged_count(0);
             app.set_vanilla_count(0);
         }
@@ -470,90 +788,46 @@ fn try_connect_game(app: &AppWindow, shared: &SharedState, path: &str) {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<(), slint::PlatformError> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() == 4 && args[1] == "--test-encode" {
-        let src = Path::new(&args[2]);
-        let dst = Path::new(&args[3]);
-        match wem::convert_to_wem(src, dst) {
-            Ok(()) => {
-                let sz = fs::metadata(dst).map(|m| m.len()).unwrap_or(0);
-                eprintln!("OK: {} -> {} ({} bytes)", src.display(), dst.display(), sz);
-            }
-            Err(e) => eprintln!("ERROR: {:#}", e),
-        }
-        return Ok(());
-    }
-    if args.len() == 4 && args[1] == "--to-wav" {
-        let src = Path::new(&args[2]);
-        let dst = Path::new(&args[3]);
-        let file = fs::File::open(src).unwrap();
-        let decoder = Decoder::new(BufReader::new(file)).unwrap();
-        let channels = Source::channels(&decoder);
-        let sample_rate = Source::sample_rate(&decoder);
-        let samples: Vec<i16> = decoder.collect();
-        let bits: u16 = 16;
-        let frame: u16 = channels * (bits / 8);
-        let avg: u32 = sample_rate * frame as u32;
-        let data_sz: u32 = (samples.len() * 2) as u32;
-        let mut out = std::io::BufWriter::new(fs::File::create(dst).unwrap());
-        use std::io::Write;
-        out.write_all(b"RIFF").unwrap();
-        out.write_all(&(36 + data_sz).to_le_bytes()).unwrap();
-        out.write_all(b"WAVEfmt ").unwrap();
-        out.write_all(&16u32.to_le_bytes()).unwrap();
-        out.write_all(&1u16.to_le_bytes()).unwrap();
-        out.write_all(&channels.to_le_bytes()).unwrap();
-        out.write_all(&sample_rate.to_le_bytes()).unwrap();
-        out.write_all(&avg.to_le_bytes()).unwrap();
-        out.write_all(&frame.to_le_bytes()).unwrap();
-        out.write_all(&bits.to_le_bytes()).unwrap();
-        out.write_all(b"data").unwrap();
-        out.write_all(&data_sz.to_le_bytes()).unwrap();
-        for s in &samples { out.write_all(&s.to_le_bytes()).unwrap(); }
-        drop(out);
-        eprintln!("WAV: {} ({} ch, {} Hz, {} samples)", dst.display(), channels, sample_rate, samples.len());
-        return Ok(());
-    }
-    if args.len() == 3 && args[1] == "--build-pak" {
-        let output = Path::new(&args[2]);
-        let staging = staging_dir();
-        let files = collect_staged_wem_files(&staging);
-        if files.is_empty() {
-            eprintln!("No staged files");
-            return Ok(());
-        }
-        match build_pak(output, &files) {
-            Ok(()) => {
-                let sz = fs::metadata(output).map(|m| m.len()).unwrap_or(0);
-                eprintln!("PAK: {} ({} bytes, {} files)", output.display(), sz, files.len());
-            }
-            Err(e) => eprintln!("ERROR: {:#}", e),
-        }
-        return Ok(());
-    }
-
     let app = AppWindow::new()?;
     app.set_application_version(VERSION.into());
 
     let shared: SharedState = Arc::new(Mutex::new(AppState {
         game_root: None,
-        last_output: None,
         track_paths: Vec::new(),
+        replacements: vec![None; WWISE_TRACKS.len()],
         audio: None,
     }));
 
+    let _ = clear_staging();
+
+    if let Some(cli) = find_wwise_cli() {
+        app.set_wwise_path(cli.parent().unwrap_or(cli.as_path()).to_string_lossy().to_string().into());
+        app.set_wwise_valid(true);
+        app.set_wwise_status(format!("Wwise found: {}", cli.file_name().unwrap_or_default().to_string_lossy()).into());
+        app.set_wwise_tone(Tone::Success as i32);
+        append_log(&app, &format!("Wwise CLI: {}", cli.display()));
+    } else {
+        app.set_wwise_valid(false);
+        app.set_wwise_status("Wwise not found. Browse to your Wwise folder or install from audiokinetic.com.".into());
+        app.set_wwise_tone(Tone::Error as i32);
+    }
+
+    let track_model = Rc::new(slint::VecModel::<TrackEntry>::default());
+    app.set_track_list(slint::ModelRc::from(track_model.clone()));
+
     if let Some(root) = find_game_install() {
         let app_ref = app.as_weak().unwrap();
-        try_connect_game(&app_ref, &shared, &root.to_string_lossy());
+        try_connect_game(&app_ref, &shared, &root.to_string_lossy(), &track_model);
     }
 
     {
         let weak = app.as_weak();
         let shared = shared.clone();
+        let model = track_model.clone();
         app.on_find_game(move || {
-            let app = weak.unwrap();
+            let Some(app) = weak.upgrade() else { return };
             if let Some(root) = find_game_install() {
-                try_connect_game(&app, &shared, &root.to_string_lossy());
+                try_connect_game(&app, &shared, &root.to_string_lossy(), &model);
             } else {
                 app.set_game_status("Could not auto-detect game. Browse manually.".into());
                 app.set_game_tone(Tone::Warning as i32);
@@ -563,7 +837,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     .set_title("Choose Oblivion Remastered folder")
                     .pick_folder()
                 {
-                    try_connect_game(&app, &shared, &folder.to_string_lossy());
+                    try_connect_game(&app, &shared, &folder.to_string_lossy(), &model);
                 }
             }
         });
@@ -572,11 +846,12 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = app.as_weak();
         let shared = shared.clone();
+        let model = track_model.clone();
         app.on_game_path_edited(move || {
-            let app = weak.unwrap();
+            let Some(app) = weak.upgrade() else { return };
             let path = app.get_game_path().to_string();
             if !path.is_empty() {
-                try_connect_game(&app, &shared, &path);
+                try_connect_game(&app, &shared, &path, &model);
             }
         });
     }
@@ -584,74 +859,32 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = app.as_weak();
         let shared = shared.clone();
+        let model = track_model.clone();
         app.on_replace_track(move |index| {
-            let app = weak.unwrap();
-            let Some(wt) = WWISE_TRACKS.get(index as usize) else {
-                return;
-            };
+            let Some(app) = weak.upgrade() else { return };
+            let idx = index as usize;
+            let Some(wt) = WWISE_TRACKS.get(idx) else { return };
 
             let dialog = rfd::FileDialog::new()
                 .set_title(format!("Replace {} ({})", wt.display_name, wt.category))
-                .add_filter("Audio Files", &["mp3", "wav", "ogg", "flac", "wem"])
-                .add_filter("Wwise Audio", &["wem"]);
+                .add_filter("Audio Files", &["mp3", "wav", "ogg", "flac", "wem"]);
 
             if let Some(source) = dialog.pick_file() {
-                let ext = source
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                let needs_encode = matches!(ext.as_str(), "mp3" | "wav" | "ogg" | "flac");
+                let fname = source.file_name().unwrap_or_default().to_string_lossy().to_string();
+                state(&shared).replacements[idx] = Some(source);
 
-                if needs_encode {
-                    let wwise_id = wt.wwise_id;
-                    let display = wt.display_name.to_string();
-                    set_status(&app, "Encoding", &format!("Converting {}...", source.file_name().unwrap_or_default().to_string_lossy()), Tone::Warning);
-                    append_log(&app, &format!("Encoding {} to WEM...", source.display()));
-                    let weak2 = app.as_weak();
-                    let prev_staged = app.get_staged_count();
-                    let prev_vanilla = app.get_vanilla_count();
-                    std::thread::spawn(move || {
-                        let result = stage_wem(wwise_id, &source);
-                        let source_display = source.display().to_string();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            let Some(app) = weak2.upgrade() else { return };
-                            match result {
-                                Ok(()) => {
-                                    append_log(&app, &format!("Staged: {} <- {} (Wwise ID {})", display, source_display, wwise_id));
-                                    app.set_staged_count(prev_staged + 1);
-                                    app.set_vanilla_count(prev_vanilla - 1);
-                                    set_status(&app, "Ready", &format!("{} staged. Build PAK to apply.", display), Tone::Success);
-                                }
-                                Err(e) => {
-                                    append_log(&app, &format!("Error: {:#}", e));
-                                    set_status(&app, "Error", &e.to_string(), Tone::Error);
-                                }
-                            }
-                        });
-                    });
-                } else {
-                    match stage_wem(wt.wwise_id, &source) {
-                        Ok(()) => {
-                            append_log(
-                                &app,
-                                &format!(
-                                    "Staged: {} <- {} (Wwise ID {})",
-                                    wt.display_name,
-                                    source.display(),
-                                    wt.wwise_id
-                                ),
-                            );
-                            if let Some(root) = state(&shared).game_root.clone() {
-                                refresh_tracks(&app, &shared, &root);
-                            }
-                        }
-                        Err(e) => {
-                            append_log(&app, &format!("Error: {}", e));
-                            set_status(&app, "Error", &e.to_string(), Tone::Error);
-                        }
-                    }
+                if let Some(mut entry) = model.row_data(idx) {
+                    entry.status = "replace".into();
+                    entry.replacement = fname.clone().into();
+                    entry.size = Default::default();
+                    model.set_row_data(idx, entry);
                 }
+                let count = state(&shared).replacements.iter().filter(|r| r.is_some()).count();
+                app.set_staged_count(count as i32);
+                app.set_vanilla_count((WWISE_TRACKS.len() - count) as i32);
+
+                append_log(&app, &format!("Queued: {} <- {}", wt.display_name, fname));
+                set_status(&app, "Ready", &format!("{} queued for replacement.", wt.display_name), Tone::Success);
             }
         });
     }
@@ -659,30 +892,32 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = app.as_weak();
         let shared = shared.clone();
+        let model = track_model.clone();
         app.on_remove_staged(move |index| {
-            let app = weak.unwrap();
-            let Some(wt) = WWISE_TRACKS.get(index as usize) else {
-                return;
-            };
+            let Some(app) = weak.upgrade() else { return };
+            let idx = index as usize;
+            let Some(wt) = WWISE_TRACKS.get(idx) else { return };
 
-            match remove_staged_wem(wt.wwise_id) {
-                Ok(()) => {
-                    append_log(&app, &format!("Removed: {}", wt.display_name));
-                    if let Some(root) = state(&shared).game_root.clone() {
-                        refresh_tracks(&app, &shared, &root);
-                    }
-                }
-                Err(e) => {
-                    append_log(&app, &format!("Error: {}", e));
-                }
+            state(&shared).replacements[idx] = None;
+
+            if let Some(mut entry) = model.row_data(idx) {
+                entry.status = "vanilla".into();
+                entry.replacement = Default::default();
+                model.set_row_data(idx, entry);
             }
+            let count = state(&shared).replacements.iter().filter(|r| r.is_some()).count();
+            app.set_staged_count(count as i32);
+            app.set_vanilla_count((WWISE_TRACKS.len() - count) as i32);
+
+            append_log(&app, &format!("Removed: {}", wt.display_name));
+            set_status(&app, "Ready", &format!("{} replacement cleared.", wt.display_name), Tone::Neutral);
         });
     }
 
     {
         let weak = app.as_weak();
         app.on_add_track(move || {
-            let app = weak.unwrap();
+            let Some(app) = weak.upgrade() else { return };
             append_log(
                 &app,
                 "Adding new tracks is not supported for Wwise audio. You can only replace existing vanilla tracks.",
@@ -694,150 +929,47 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = app.as_weak();
         let shared = shared.clone();
         app.on_build_pak(move || {
-            let app = weak.unwrap();
-            app.set_build_running(true);
-            app.set_build_complete(false);
-            set_status(
-                &app,
-                "Building",
-                "Packaging staged tracks into PAK...",
-                Tone::Warning,
-            );
-            append_log(&app, "--- Build started ---");
-
-            let staging = staging_dir();
-            let staged_files = collect_staged_wem_files(&staging);
-
-            if staged_files.is_empty() {
-                set_status(
-                    &app,
-                    "Nothing to build",
-                    "No staged files found.",
-                    Tone::Error,
-                );
-                append_log(&app, "Build aborted: no staged files.");
-                app.set_build_running(false);
-                return;
-            }
-
-            append_log(
-                &app,
-                &format!("Packaging {} file(s)...", staged_files.len()),
-            );
-
-            let dialog = rfd::FileDialog::new()
-                .set_title("Save music mod PAK")
-                .set_file_name("zzz_MusicMod_P.pak")
-                .add_filter("UE5 PAK", &["pak"]);
-
-            let output_path = if let Some(game_root) = state(&shared).game_root.clone() {
-                let paks_dir = game_root.join(PAKS_REL);
-                if paks_dir.is_dir() {
-                    dialog.set_directory(&paks_dir).save_file()
-                } else {
-                    dialog.save_file()
-                }
-            } else {
-                dialog.save_file()
-            };
-
-            let Some(output_path) = output_path else {
-                set_status(&app, "Cancelled", "Build was cancelled.", Tone::Neutral);
-                append_log(&app, "Build cancelled by user.");
-                app.set_build_running(false);
-                return;
-            };
-
-            for (pak_path, disk_path) in &staged_files {
-                append_log(
-                    &app,
-                    &format!(
-                        "  + {} ({})",
-                        pak_path,
-                        human_size(fs::metadata(disk_path).map(|m| m.len()).unwrap_or(0))
-                    ),
-                );
-            }
-
-            match build_pak(&output_path, &staged_files) {
-                Ok(()) => {
-                    let pak_size =
-                        fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
-                    state(&shared).last_output = Some(output_path.clone());
-                    app.set_output_path(
-                        output_path.to_string_lossy().to_string().into(),
-                    );
-                    app.set_build_complete(true);
-                    set_status(
-                        &app,
-                        "Build complete",
-                        &format!(
-                            "{} ({}) is ready. Drop it into the game's Paks folder.",
-                            output_path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy(),
-                            human_size(pak_size),
-                        ),
-                        Tone::Success,
-                    );
-                    append_log(
-                        &app,
-                        &format!(
-                            "PAK written: {} ({})",
-                            output_path.display(),
-                            human_size(pak_size)
-                        ),
-                    );
-                }
-                Err(e) => {
-                    set_status(&app, "Build failed", &e.to_string(), Tone::Error);
-                    append_log(&app, &format!("Build error: {}", e));
-                }
-            }
-
-            app.set_build_running(false);
+            let Some(app) = weak.upgrade() else { return };
+            start_build(&app, &shared, BuildTarget::Install);
         });
     }
 
     {
         let weak = app.as_weak();
         let shared = shared.clone();
+        let model = track_model.clone();
         app.on_restore_staging(move || {
-            let app = weak.unwrap();
-            match clear_staging() {
-                Ok(()) => {
-                    append_log(&app, "Staging directory cleared.");
-                    set_status(
-                        &app,
-                        "Cleared",
-                        "All staged tracks removed.",
-                        Tone::Neutral,
-                    );
-                    if let Some(root) = state(&shared).game_root.clone() {
-                        refresh_tracks(&app, &shared, &root);
-                    }
+            let Some(app) = weak.upgrade() else { return };
+            {
+                let mut st = state(&shared);
+                for r in st.replacements.iter_mut() {
+                    *r = None;
                 }
-                Err(e) => {
-                    append_log(&app, &format!("Error clearing staging: {}", e));
-                }
+            }
+            append_log(&app, "All replacements cleared.");
+            set_status(&app, "Cleared", "All queued tracks removed.", Tone::Neutral);
+            if let Some(root) = state(&shared).game_root.clone() {
+                refresh_tracks(&app, &shared, &root, &model);
             }
         });
     }
 
     {
         app.on_open_kofi(move || {
-            let _ = Command::new("cmd").args(["/c", "start", KOFI_URL]).spawn();
+            let _ = wem_encoder::quiet_command("cmd").args(["/c", "start", KOFI_URL]).spawn();
         });
     }
 
     {
-        let shared = shared.clone();
+        let weak = app.as_weak();
         app.on_open_output(move || {
-            if let Some(path) = &state(&shared).last_output {
-                if let Some(parent) = path.parent() {
-                    let _ = Command::new("explorer").arg(parent).spawn();
-                }
+            let Some(app) = weak.upgrade() else { return };
+            let path = PathBuf::from(app.get_output_path().to_string());
+            if path.is_file() {
+                // Open Explorer with the output file highlighted.
+                let _ = Command::new("explorer").arg("/select,").arg(&path).spawn();
+            } else if let Some(parent) = path.parent() {
+                let _ = Command::new("explorer").arg(parent).spawn();
             }
         });
     }
@@ -849,7 +981,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let shared = shared.clone();
         let timer = playback_timer.clone();
         app.on_play_track(move |index| {
-            let app = weak.unwrap();
+            let Some(app) = weak.upgrade() else { return };
             let path = {
                 let st = state(&shared);
                 st.track_paths.get(index as usize).cloned().flatten()
@@ -953,7 +1085,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let shared = shared.clone();
         let timer = playback_timer.clone();
         app.on_stop_playback(move || {
-            let app = weak.unwrap();
+            let Some(app) = weak.upgrade() else { return };
             state(&shared).audio = None;
             app.set_playing_index(-1);
             app.set_playing_progress(0.0);
@@ -968,7 +1100,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = app.as_weak();
         let shared = shared.clone();
         app.on_toggle_pause(move || {
-            let app = weak.unwrap();
+            let Some(app) = weak.upgrade() else { return };
             let st = state(&shared);
             if let Some(audio) = &st.audio {
                 if audio.sink.is_paused() {
@@ -999,7 +1131,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = app.as_weak();
         app.on_copy_log(move || {
-            let app = weak.unwrap();
+            let Some(app) = weak.upgrade() else { return };
             let text = app.get_log_text().to_string();
             if let Ok(mut clipboard) = arboard::Clipboard::new() {
                 let _ = clipboard.set_text(&text);
@@ -1007,5 +1139,180 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
+    {
+        let weak = app.as_weak();
+        app.on_browse_wwise(move || {
+            let Some(app) = weak.upgrade() else { return };
+            if let Some(folder) = rfd::FileDialog::new()
+                .set_title("Locate Wwise installation folder")
+                .pick_folder()
+            {
+                let path_str = folder.to_string_lossy().to_string();
+                app.set_wwise_path(path_str.clone().into());
+                if let Some(cli) = wem_encoder::find_wwise_cli_in(Some(&folder)) {
+                    app.set_wwise_valid(true);
+                    app.set_wwise_status("Wwise found.".into());
+                    app.set_wwise_tone(Tone::Success as i32);
+                    append_log(&app, &format!("Wwise CLI: {}", cli.display()));
+                } else {
+                    app.set_wwise_valid(false);
+                    app.set_wwise_status("WwiseConsole.exe not found in that folder.".into());
+                    app.set_wwise_tone(Tone::Error as i32);
+                }
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        app.on_wwise_path_edited(move || {
+            let Some(app) = weak.upgrade() else { return };
+            let path = app.get_wwise_path().to_string();
+            if !path.is_empty() {
+                if let Some(cli) = wem_encoder::find_wwise_cli_in(Some(Path::new(&path))) {
+                    app.set_wwise_valid(true);
+                    app.set_wwise_status("Wwise found.".into());
+                    app.set_wwise_tone(Tone::Success as i32);
+                    append_log(&app, &format!("Wwise CLI: {}", cli.display()));
+                } else {
+                    app.set_wwise_valid(false);
+                    app.set_wwise_status("WwiseConsole.exe not found at that path.".into());
+                    app.set_wwise_tone(Tone::Error as i32);
+                }
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let shared = shared.clone();
+        app.on_export_pak(move || {
+            let Some(app) = weak.upgrade() else { return };
+            if queued_replacements(&shared).is_empty() {
+                set_status(&app, "Nothing to export", "No tracks queued.", Tone::Error);
+                return;
+            }
+
+            let Some(path) = rfd::FileDialog::new()
+                .set_title("Export music mod PAK")
+                .set_file_name("MusicMod_P.pak")
+                .add_filter("UE5 PAK", &["pak"])
+                .save_file()
+            else {
+                return;
+            };
+
+            start_build(&app, &shared, BuildTarget::ExportPak(ensure_extension(path, "pak")));
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let shared = shared.clone();
+        app.on_package_mod(move || {
+            let Some(app) = weak.upgrade() else { return };
+            if queued_replacements(&shared).is_empty() {
+                set_status(&app, "Nothing to package", "No tracks queued.", Tone::Error);
+                return;
+            }
+
+            let Some(path) = rfd::FileDialog::new()
+                .set_title("Package release ZIP")
+                .set_file_name("MyMusicMod.zip")
+                .add_filter("ZIP archive", &["zip"])
+                .save_file()
+            else {
+                return;
+            };
+
+            let zip_path = ensure_extension(path, "zip");
+            let mod_name = mod_name_from_path(&zip_path);
+            append_log(
+                &app,
+                &format!("Packaging as \"{}\" -> {}/{}_P.pak", mod_name, RELEASE_PAK_DIR, mod_name),
+            );
+            start_build(&app, &shared, BuildTarget::Package { zip_path, mod_name });
+        });
+    }
+
+    let ui_sync_timer = Rc::new(Timer::default());
+    {
+        let weak = app.as_weak();
+        let timer = ui_sync_timer.clone();
+        timer.start(TimerMode::Repeated, Duration::from_millis(200), move || {
+            let Some(app) = weak.upgrade() else { return };
+            if app.get_encoding_active() {
+                let cur = app.get_encoding_progress();
+                if cur < 0.92 {
+                    app.set_encoding_progress(cur + (0.95 - cur) * 0.04);
+                }
+            }
+        });
+    }
+
     app.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn ensure_extension_appends_only_when_missing() {
+        assert_eq!(ensure_extension(PathBuf::from(r"C:\x\Mod"), "zip"), PathBuf::from(r"C:\x\Mod.zip"));
+        assert_eq!(ensure_extension(PathBuf::from(r"C:\x\Mod.ZIP"), "zip"), PathBuf::from(r"C:\x\Mod.ZIP"));
+        assert_eq!(ensure_extension(PathBuf::from(r"C:\x\My.Mod"), "zip"), PathBuf::from(r"C:\x\My.Mod.zip"));
+        assert_eq!(ensure_extension(PathBuf::from(r"C:\x\Mod_P"), "pak"), PathBuf::from(r"C:\x\Mod_P.pak"));
+    }
+
+    #[test]
+    fn mod_name_is_derived_from_zip_stem() {
+        assert_eq!(mod_name_from_path(Path::new(r"C:\out\Epic Music.zip")), "Epic Music");
+        assert_eq!(mod_name_from_path(Path::new(r"C:\out\EpicMusic_P.zip")), "EpicMusic");
+        assert_eq!(mod_name_from_path(Path::new(r"C:\out\my-mod-.zip")), "my-mod");
+        assert_eq!(mod_name_from_path(Path::new(r"C:\out\_P.zip")), "MusicMod");
+    }
+
+    #[test]
+    fn release_zip_contains_pak_in_mods_layout_and_readme() {
+        let dir = std::env::temp_dir().join(format!("obr-music-tool-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pak_path = dir.join("Epic Music_P.pak");
+        fs::write(&pak_path, b"not really a pak").unwrap();
+        let zip_path = dir.join("Epic Music.zip");
+        let included = vec![(0usize, PathBuf::from(r"C:\songs\my battle song.mp3"))];
+
+        write_release_zip(&zip_path, "Epic Music", &pak_path, &included).unwrap();
+
+        let mut archive = zip::ZipArchive::new(fs::File::open(&zip_path).unwrap()).unwrap();
+        let mut names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "OblivionRemastered/Content/Paks/~mods/Epic Music_P.pak".to_string(),
+                "README.txt".to_string(),
+            ]
+        );
+
+        let mut pak = Vec::new();
+        archive
+            .by_name("OblivionRemastered/Content/Paks/~mods/Epic Music_P.pak")
+            .unwrap()
+            .read_to_end(&mut pak)
+            .unwrap();
+        assert_eq!(pak, b"not really a pak");
+
+        let mut readme = String::new();
+        archive.by_name("README.txt").unwrap().read_to_string(&mut readme).unwrap();
+        assert!(readme.starts_with("Epic Music\r\n==========\r\n"), "{readme}");
+        assert!(readme.contains(r"OblivionRemastered\Content\Paks\~mods\Epic Music_P.pak"), "{readme}");
+        assert!(readme.contains("REPLACED TRACKS (1)"), "{readme}");
+        assert!(readme.contains("Battle   Battle 01      <- my battle song.mp3"), "{readme}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -5,60 +5,83 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 pub fn find_wwise_cli() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("WWISEROOT") {
-        let cli = PathBuf::from(&path)
-            .join("Authoring")
-            .join("x64")
-            .join("Release")
-            .join("bin")
-            .join("WwiseConsole.exe");
-        if cli.is_file() {
-            return Some(cli);
+    find_wwise_cli_in(None)
+}
+
+pub fn find_wwise_cli_in(hint: Option<&Path>) -> Option<PathBuf> {
+    if let Some(dir) = hint {
+        if let Some(found) = check_wwise_tree(dir) {
+            return Some(found);
         }
     }
-    for base in [
-        std::env::var_os("ProgramFiles").map(PathBuf::from),
-        std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
-        Some(PathBuf::from(r"C:\Audiokinetic")),
-        Some(PathBuf::from(r"D:\Audiokinetic")),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        for dir in scan_audiokinetic_dirs(&base) {
-            let cli = dir
-                .join("Authoring")
-                .join("x64")
-                .join("Release")
-                .join("bin")
-                .join("WwiseConsole.exe");
-            if cli.is_file() {
-                return Some(cli);
+    if let Some(path) = std::env::var_os("WWISEROOT") {
+        if let Some(found) = check_wwise_tree(Path::new(&path)) {
+            return Some(found);
+        }
+    }
+    let mut search_roots: Vec<PathBuf> = Vec::new();
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(pf) = std::env::var_os(var) {
+            search_roots.push(PathBuf::from(pf));
+        }
+    }
+    for drive in b'C'..=b'Z' {
+        let root = PathBuf::from(format!("{}:\\", drive as char));
+        if !root.exists() {
+            continue;
+        }
+        search_roots.push(root.join("Audiokinetic"));
+        if let Ok(entries) = fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let n = name.to_string_lossy();
+                if n.contains("Audiokinetic") || n.starts_with("Wwise") {
+                    search_roots.push(entry.path());
+                }
+            }
+        }
+    }
+    for base in &search_roots {
+        for dir in scan_wwise_dirs(base) {
+            if let Some(found) = check_wwise_tree(&dir) {
+                return Some(found);
             }
         }
     }
     None
 }
 
-fn scan_audiokinetic_dirs(base: &Path) -> Vec<PathBuf> {
+fn check_wwise_tree(dir: &Path) -> Option<PathBuf> {
+    let cli = dir
+        .join("Authoring")
+        .join("x64")
+        .join("Release")
+        .join("bin")
+        .join("WwiseConsole.exe");
+    if cli.is_file() {
+        return Some(cli);
+    }
+    None
+}
+
+fn scan_wwise_dirs(base: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    let audiokinetic = base.join("Audiokinetic");
-    if audiokinetic.is_dir() {
-        if let Ok(entries) = fs::read_dir(&audiokinetic) {
-            for entry in entries.flatten() {
+    if !base.is_dir() {
+        return dirs;
+    }
+    dirs.push(base.to_path_buf());
+    if let Ok(entries) = fs::read_dir(base) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("Wwise") || name.contains("Audiokinetic") {
                 dirs.push(entry.path());
             }
         }
     }
-    if base.file_name().map(|n| n.to_string_lossy().contains("Audiokinetic")).unwrap_or(false)
-        || base.file_name().map(|n| n.to_string_lossy().starts_with("Wwise")).unwrap_or(false)
-    {
-        dirs.push(base.to_path_buf());
-    }
-    if let Ok(entries) = fs::read_dir(base) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("Wwise") {
+    let audiokinetic = base.join("Audiokinetic");
+    if audiokinetic.is_dir() {
+        if let Ok(entries) = fs::read_dir(&audiokinetic) {
+            for entry in entries.flatten() {
                 dirs.push(entry.path());
             }
         }
@@ -141,7 +164,7 @@ pub fn encode_to_wem(source: &Path, output: &Path) -> Result<()> {
     let project_dir = temp_dir.join("WemProject");
     if !project_dir.join("WemProject.wproj").is_file() {
         let _ = fs::remove_dir_all(&project_dir);
-        let status = std::process::Command::new(&cli)
+        let status = quiet_command(&cli)
             .args([
                 "create-new-project",
                 &project_dir.join("WemProject.wproj").to_string_lossy(),
@@ -173,7 +196,7 @@ pub fn encode_to_wem(source: &Path, output: &Path) -> Result<()> {
     let out_dir = temp_dir.join("wem_output");
     fs::create_dir_all(&out_dir)?;
 
-    let status = std::process::Command::new(&cli)
+    let status = quiet_command(&cli)
         .args([
             "convert-external-source",
             &project_dir.join("WemProject.wproj").to_string_lossy(),
@@ -225,4 +248,16 @@ fn find_wem_in_dir(dir: &Path) -> Result<Option<PathBuf>> {
         }
     }
     Ok(None)
+}
+
+/// A `Command` that will not flash a console window when this GUI app spawns a console program.
+pub fn quiet_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
 }

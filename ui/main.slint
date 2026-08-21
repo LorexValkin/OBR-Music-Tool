@@ -18,6 +18,7 @@ export struct TrackEntry {
     filename: string,
     size: string,
     status: string,
+    replacement: string,
 }
 
 export component AppWindow inherits Window {
@@ -45,6 +46,14 @@ export component AppWindow inherits Window {
     in-out property <bool> build-complete: false;
     in-out property <string> output-path: "";
     in-out property <string> add-category: "Explore";
+    in-out property <string> wwise-path: "";
+    in-out property <bool> wwise-valid: false;
+    in-out property <string> wwise-status: "Searching for Wwise...";
+    in-out property <int> wwise-tone: 0;
+    in-out property <bool> needs-refresh: false;
+    in-out property <bool> encoding-active: false;
+    in-out property <string> encoding-file: "";
+    in-out property <float> encoding-progress: 0;
     in-out property <int> playing-index: -1;
     in-out property <string> playing-filename: "";
     in-out property <float> playing-progress: 0;
@@ -65,6 +74,8 @@ export component AppWindow inherits Window {
     callback remove-staged(int);
     callback add-track();
     callback build-pak();
+    callback export-pak();
+    callback package-mod();
     callback restore-staging();
     callback open-kofi();
     callback open-output();
@@ -73,6 +84,8 @@ export component AppWindow inherits Window {
     callback stop-playback();
     callback toggle-pause();
     callback seek-to(float);
+    callback browse-wwise();
+    callback wwise-path-edited();
 
     background: Theme.window-background;
 
@@ -218,39 +231,25 @@ export component AppWindow inherits Window {
                     }
 
                     VerticalLayout {
-                        spacing: 6px;
+                        min-height: 86px;
+                        max-height: 86px;
                         vertical-stretch: 0;
+                        spacing: 4px;
 
-                        Text {
-                            text: "ADD NEW TRACK";
-                            color: Theme.text-secondary;
-                            font-size: 12px;
-                            font-weight: 600;
+                        PathField {
+                            label: "WWISE AUTHORING";
+                            placeholder: "Wwise installation folder";
+                            primary-action: "Browse";
+                            primary-width: 86px;
+                            value <=> root.wwise-path;
+                            enabled: !root.build-running;
+                            primary-clicked => { root.browse-wwise(); }
+                            edited => { root.wwise-path-edited(); }
                         }
 
-                        HorizontalLayout {
-                            height: 40px;
-                            spacing: 8px;
-
-                            ComboBox {
-                                width: 120px;
-                                model: ["Battle", "Dungeon", "Explore", "Public", "Special"];
-                                current-value <=> root.add-category;
-                                enabled: !root.build-running && root.game-valid;
-                            }
-
-                            PrimaryButton {
-                                horizontal-stretch: 1;
-                                text: "Add MP3";
-                                enabled: !root.build-running && root.game-valid;
-                                clicked => { root.add-track(); }
-                            }
-                        }
-
-                        Text {
-                            text: "Adds a new track to the selected category rotation.";
-                            color: Theme.text-muted;
-                            font-size: 11px;
+                        StatusLine {
+                            text: root.wwise-status;
+                            tone: root.wwise-tone;
                         }
                     }
 
@@ -258,6 +257,49 @@ export component AppWindow inherits Window {
                         height: 1px;
                         vertical-stretch: 0;
                         background: Theme.border;
+                    }
+
+                    if root.encoding-active : VerticalLayout {
+                        spacing: 4px;
+                        vertical-stretch: 0;
+
+                        Text {
+                            text: "ENCODING";
+                            color: Theme.text-secondary;
+                            font-size: 12px;
+                            font-weight: 600;
+                        }
+
+                        Text {
+                            text: root.encoding-file;
+                            color: Theme.warning;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+
+                        Rectangle {
+                            height: 8px;
+                            vertical-stretch: 0;
+                            background: Theme.surface-raised;
+                            border-color: Theme.border;
+                            border-width: 1px;
+                            border-radius: 4px;
+
+                            Rectangle {
+                                x: 1px;
+                                y: 1px;
+                                width: max(0px, (parent.width - 2px) * root.encoding-progress);
+                                height: parent.height - 2px;
+                                background: Theme.warning;
+                                border-radius: 3px;
+                            }
+                        }
+
+                        Rectangle {
+                            height: 1px;
+                            vertical-stretch: 0;
+                            background: Theme.border;
+                        }
                     }
 
                     VerticalLayout {
@@ -287,17 +329,43 @@ export component AppWindow inherits Window {
 
                             PrimaryButton {
                                 horizontal-stretch: 1;
-                                text: root.build-running ? "Building..." : "Build PAK";
+                                text: root.build-running ? "Working..." : "Build & install PAK";
                                 enabled: root.can-build;
                                 clicked => { root.build-pak(); }
                             }
 
                             DangerButton {
-                                width: 100px;
+                                width: 80px;
                                 text: "Clear all";
                                 enabled: root.can-restore;
                                 clicked => { root.restore-staging(); }
                             }
+                        }
+
+                        HorizontalLayout {
+                            height: 44px;
+                            spacing: 8px;
+
+                            PrimaryButton {
+                                horizontal-stretch: 1;
+                                text: "Export PAK";
+                                enabled: root.can-build;
+                                clicked => { root.export-pak(); }
+                            }
+
+                            PrimaryButton {
+                                horizontal-stretch: 1;
+                                text: "Package release ZIP";
+                                enabled: root.can-build;
+                                clicked => { root.package-mod(); }
+                            }
+                        }
+
+                        Text {
+                            text: "Build installs into the game. Export saves a loose PAK. Package bundles a ready-to-upload ZIP (PAK in ~mods layout + README); the ZIP file name becomes the mod name.";
+                            color: Theme.text-muted;
+                            font-size: 11px;
+                            wrap: word-wrap;
                         }
                     }
 
@@ -454,20 +522,31 @@ export component AppWindow inherits Window {
                                         overflow: elide;
                                     }
 
-                                    Text {
+                                    VerticalLayout {
                                         horizontal-stretch: 1;
-                                        text: entry.filename;
-                                        color: root.playing-index == index ? Theme.success : Theme.text-primary;
-                                        font-size: 12px;
-                                        font-family: "Consolas";
-                                        font-weight: root.playing-index == index ? 700 : 400;
-                                        vertical-alignment: center;
-                                        overflow: elide;
+                                        alignment: center;
+                                        spacing: 1px;
+
+                                        Text {
+                                            text: entry.filename;
+                                            color: root.playing-index == index ? Theme.success : Theme.text-primary;
+                                            font-size: 12px;
+                                            font-family: "Consolas";
+                                            font-weight: root.playing-index == index ? 700 : 400;
+                                            overflow: elide;
+                                        }
+
+                                        if entry.replacement != "" : Text {
+                                            text: entry.replacement;
+                                            color: Theme.warning;
+                                            font-size: 10px;
+                                            overflow: elide;
+                                        }
                                     }
 
                                     Text {
                                         width: 70px;
-                                        text: entry.size;
+                                        text: entry.replacement != "" ? "" : entry.size;
                                         color: Theme.text-muted;
                                         font-size: 11px;
                                         vertical-alignment: center;
