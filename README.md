@@ -1,22 +1,22 @@
 # OBR Music Tool
 
 Replace the music in **The Elder Scrolls IV: Oblivion Remastered** with your own tracks.
-Pick a song for any of the game's 28 music tracks, click one button, and play — no Unreal Engine,
+Pick a song for any of the game's 28 music tracks, click one button, and play. No Unreal Engine,
 no hex editing, no hand-built soundbanks. Everything runs locally on your PC.
 
 ![OBR Music Tool](docs/obr-music-tool.png)
 
 ## What it does
 
-- **Lists every vanilla music track** — Battle, Dungeon, Explore, Public (towns) and Special (title screen, death, success) — with built-in preview playback so you know which track you are replacing.
+- **Lists every vanilla music track**: Battle, Dungeon, Explore, Public (towns) and Special (title screen, death, success), with built-in preview playback so you know which track you are replacing.
 - **Accepts normal audio files** as replacements: `.mp3`, `.wav`, `.ogg`, `.flac` (or pre-encoded `.wem`).
 - **Converts them to the game's format** (Wwise Vorbis `.wem`) using Audiokinetic's own encoder, so the output is exactly what the game expects.
-- **Builds a UE5 patch `.pak`** that overrides the original tracks. Your game files are never modified — delete the pak and everything is vanilla again.
+- **Builds a UE5 patch `.pak`** that overrides the original tracks. Your game files are never modified; delete the pak and everything is vanilla again.
 - **Three ways to get the result out:**
-  - **Build & install PAK** — writes the pak straight into your game's `Paks` folder. Launch the game and you're done.
-  - **Export PAK** — saves a loose `.pak` wherever you like.
-  - **Package release ZIP** — produces a ready-to-upload mod archive (pak in the standard `~mods` layout plus a generated `README.txt` listing the replaced tracks). The zip's file name becomes the mod's name.
-- **Saves playlists** — a small `.obrplaylist` file remembers which audio file goes on which track, so you can reopen a mod later, swap a few songs and rebuild without redoing the rest.
+  - **Build & install PAK**: writes the pak straight into your game's `Paks` folder. Launch the game and you're done.
+  - **Export PAK**: saves a loose `.pak` wherever you like.
+  - **Package release ZIP**: produces a ready-to-upload mod archive (pak in the standard `~mods` layout plus a generated `README.txt` listing the replaced tracks). The zip's file name becomes the mod's name.
+- **Saves playlists**: a small `.obrplaylist` file remembers which audio file goes on which track, so you can reopen a mod later, swap a few songs and rebuild without redoing the rest.
 
 > **Scope:** the tool *replaces* the existing 28 tracks. Adding brand-new tracks to the playlist is not supported, because which tracks play (and when) is defined inside the game's Wwise soundbanks, not by the audio files.
 
@@ -35,7 +35,7 @@ No admin rights are required and the tool never connects to the internet.
 ### Why is this needed?
 
 Oblivion Remastered plays its music through **Audiokinetic Wwise**. Each track is stored as a `.wem`
-file — a Wwise-specific container around Vorbis audio. The encoder that produces compatible `.wem` files
+file, a Wwise-specific container around Vorbis audio. The encoder that produces compatible `.wem` files
 is part of Wwise Authoring, which is free to download and use but cannot be redistributed with this tool.
 So you install it once yourself, and OBR Music Tool drives its command-line converter (`WwiseConsole.exe`)
 behind the scenes. You never have to open Wwise.
@@ -46,7 +46,7 @@ behind the scenes. You never have to open Wwise.
    Audiokinetic account if you don't have one, and download and install the Launcher.
 2. **Install a Wwise version.** Open the Launcher, go to the **Wwise** tab, and click
    **Install a Wwise version**. Any recent version works (the tool was developed against 2024.1.x).
-3. **Trim the install.** On the options page, select only what is needed — this keeps the download at
+3. **Trim the install.** On the options page, select only what is needed; this keeps the download at
    roughly 2 GB instead of 10+:
    - **Packages:** tick **Authoring**. Untick *SDK (C++)*, *Documentation* and *Samples*.
    - **Deployment Platforms:** leave **Windows** ticked (it is by default). Untick everything else.
@@ -57,7 +57,7 @@ behind the scenes. You never have to open Wwise.
    Program Files, in any `Audiokinetic` folder on any drive, and in the `WWISEROOT` environment variable.
    The *Wwise Authoring* line in the Setup panel turns green when it is found.
 
-   If it says *Wwise not found*, click **Browse** and choose the **Wwise version folder** — the one that
+   If it says *Wwise not found*, click **Browse** and choose the **Wwise version folder**, the one that
    contains the `Authoring` subfolder (e.g. `...\Audiokinetic\Wwise 2024.1.16.9140`).
 
 You can uninstall Wwise from the Launcher at any time; only the `.wem` conversion depends on it.
@@ -72,7 +72,7 @@ You can uninstall Wwise from the Launcher at any time; only the `.wem` conversio
    **Clear all** resets everything. Replacement tracks can be any length, sample rate or channel layout.
 4. **Produce the output:**
    - **Build & install PAK** writes `OblivionRemastered\Content\Paks\zzz_MusicMod_P.pak` into your game.
-     Start the game — the new music is live.
+     Start the game and the new music is live.
    - **Export PAK** asks where to save a loose `.pak` (drop it into `Content\Paks` or `Content\Paks\~mods` to use it).
    - **Package release ZIP** asks for a zip name, e.g. `EpicBattleMusic.zip`, and produces:
      ```
@@ -82,7 +82,7 @@ You can uninstall Wwise from the Launcher at any time; only the `.wem` conversio
      ```
      That layout installs cleanly through Vortex / MO2 and by extracting into the game folder, so it
      can go straight to Nexus Mods.
-   Export and Package first show a short copyright reminder — only share music you own, have permission to
+   Export and Package first show a short copyright reminder: only share music you own, have permission to
    redistribute, or that is free to use (see [Legal](#legal)). Tick *Don't show this again* to skip it in future; delete
    `%LOCALAPPDATA%\OBRMusicTool\export-warning-acknowledged` to bring it back.
 5. **Open output** (in the Activity log header) reveals the finished file in Explorer.
@@ -104,16 +104,16 @@ with one click if you need to report a problem.
 4. The resulting `.wem` files are written into a UE5 (v11) pak at
    `OblivionRemastered/Content/WwiseAudio/Media/<id>.wem` with the standard `../../../` mount point.
 5. Because the file name ends in `_P`, Unreal loads it as a patch pak and it takes priority over the
-   original media — which is why the replacement works without touching the game's soundbanks.
+   original media, which is why the replacement works without touching the game's soundbanks.
 
 ## Track list
 
 | Category | Tracks | Original files |
 |---|---|---|
-| Battle | Battle 01 – 08 | `battle_01.mp3` … `battle_08.mp3` |
-| Dungeon | Dungeon 01 v2, Dungeon 02 – 05 | `Dungeon_01_v2.mp3`, `dungeon_02.mp3` … `dungeon_05.mp3` |
+| Battle | Battle 01-08 | `battle_01.mp3` … `battle_08.mp3` |
+| Dungeon | Dungeon 01 v2, Dungeon 02-05 | `Dungeon_01_v2.mp3`, `dungeon_02.mp3` … `dungeon_05.mp3` |
 | Explore | Atmosphere 01, 03, 04, 06, 07, 08, 09 | `atmosphere_01.mp3` … `atmosphere_09.mp3` |
-| Public | Town 01 – 05 | `town_01.mp3` … `town_05.mp3` |
+| Public | Town 01-05 | `town_01.mp3` … `town_05.mp3` |
 | Special | Title Screen, Death, Success | `tes4title.mp3`, `death.mp3`, `success.mp3` |
 
 ## Troubleshooting
@@ -123,7 +123,7 @@ with one click if you need to report a problem.
 | *Wwise not found* | Click **Browse** and select the Wwise **version** folder (the one containing `Authoring`). Or set the `WWISEROOT` environment variable to it. |
 | *WwiseConsole conversion failed* | Make sure the **Windows** deployment platform was included in the Wwise install. Try re-saving the source as `.wav`; confirm the file plays in a normal media player. |
 | Build succeeds but the music is unchanged in-game | Confirm the pak is in `OblivionRemastered\Content\Paks` (or `Paks\~mods`) and its name ends with `_P.pak`. Remove other music mods that replace the same tracks. |
-| Game not detected | Click **Find game** and pick the install folder — the one that contains `OblivionRemastered` and `Engine`. You can also set `OBLIVION_REMASTERED_ROOT`. |
+| Game not detected | Click **Find game** and pick the install folder, the one that contains `OblivionRemastered` and `Engine`. You can also set `OBLIVION_REMASTERED_ROOT`. |
 | Preview says *packed inside IoStore* | That track has no loose `.mp3` in your install, so it cannot be previewed. Replacing it still works. |
 
 ## Building from source
@@ -155,7 +155,7 @@ music mod anywhere, make sure every track is one of the following:
 
 - your own work,
 - music the rights holder has explicitly allowed you to redistribute, or
-- music that is free to use — royalty-free, Creative Commons, public domain or a similar open license
+- music that is free to use: royalty-free, Creative Commons, public domain or a similar open license
   (read the terms; many require you to credit the artist).
 
 Distributing copyrighted music without permission can lead to takedown notices, account strikes or legal
