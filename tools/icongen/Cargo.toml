@@ -1,0 +1,9 @@
+# Generates ui/assets/icon.png and icon.ico from icon.svg:
+#   cargo run --release --manifest-path tools/icongen/Cargo.toml -- ui/assets/icon.svg ui/assets
+[package]
+name = "icongen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+resvg = "0.45"

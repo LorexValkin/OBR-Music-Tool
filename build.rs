@@ -26,7 +26,16 @@ fn main() {
   </application>
 </assembly>
 "#;
+        // Forward slashes: backslashes are escape characters inside .rc string literals.
+        let icon = format!(
+            "{}/ui/assets/icon.ico",
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR")
+        )
+        .replace('\\', "/");
+        println!("cargo:rerun-if-changed=ui/assets/icon.ico");
+
         winresource::WindowsResource::new()
+            .set_icon(&icon)
             .set_manifest(manifest)
             .set("FileDescription", "OBR Music Tool")
             .set("ProductName", "Oblivion Remastered Music Tool")

@@ -1,3 +1,5 @@
+<p align="center"><img src="ui/assets/icon.png" width="128" alt="OBR Music Tool icon"></p>
+
 # OBR Music Tool
 
 Replace the music in **The Elder Scrolls IV: Oblivion Remastered** with your own tracks.
@@ -137,6 +139,13 @@ cargo build --release
 ```
 
 The executable is written to `target\release\obr-music-tool.exe`. Run `cargo test` for the unit tests.
+
+The app icon lives in `ui/assets/icon.svg`; the `icon.png` (window icon) and `icon.ico` (exe icon) next to it
+are generated from it with:
+
+```
+cargo run --release --manifest-path tools/icongen/Cargo.toml -- ui/assets/icon.svg ui/assets
+```
 
 Built with [Slint](https://slint.dev) (UI), [repak](https://github.com/trumank/repak) (pak writer),
 [rodio](https://github.com/RustAudio/rodio) (audio decoding and preview) and [zip](https://github.com/zip-rs/zip2).
