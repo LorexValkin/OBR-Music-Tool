@@ -40,6 +40,15 @@ fn main() {
             .set("FileDescription", "OBR Music Tool")
             .set("ProductName", "Oblivion Remastered Music Tool")
             .set("OriginalFilename", "OBR Music Tool.exe")
+            .set("CompanyName", "Computer Works")
+            .set(
+                "LegalCopyright",
+                "Copyright (c) 2026 Lorex (LorexValkin). Free and open-source software, OBR Music Tool License.",
+            )
+            .set(
+                "Comments",
+                "Free, open-source tool by Lorex; no paywalls. Release builds are code-signed by Computer Works, a company owned by the developer. Not affiliated with Bethesda Softworks, Virtuos or Audiokinetic. Source: https://github.com/LorexValkin/OBR-Music-Tool",
+            )
             .compile()
             .expect("compile Windows application resources");
     }
