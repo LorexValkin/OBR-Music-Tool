@@ -1,0 +1,199 @@
+//! Decode Wwise `.wem` media to PCM for in-app preview.
+//!
+//! Oblivion Remastered uses Wwise Vorbis (format tag `0xFFFF`) for nearly all
+//! sounds and plain 16-bit PCM (`0xFFFE`/`0x0001`) for a few ambience beds.
+//! Vorbis is rebuilt into a standard Ogg stream with `ww2ogg` and decoded by
+//! rodio's Vorbis decoder.
+
+use anyhow::{bail, Context, Result};
+use rodio::Source;
+use std::io::Cursor;
+use std::time::Duration;
+
+#[derive(Debug)]
+pub struct DecodedAudio {
+    pub channels: u16,
+    pub sample_rate: u32,
+    pub samples: Vec<i16>,
+}
+
+impl DecodedAudio {
+    pub fn duration(&self) -> Duration {
+        if self.channels == 0 || self.sample_rate == 0 {
+            return Duration::ZERO;
+        }
+        let frames = self.samples.len() as u64 / self.channels as u64;
+        Duration::from_secs_f64(frames as f64 / self.sample_rate as f64)
+    }
+
+    pub fn into_source(self) -> rodio::buffer::SamplesBuffer<i16> {
+        rodio::buffer::SamplesBuffer::new(self.channels, self.sample_rate, self.samples)
+    }
+}
+
+fn u16_at(b: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes([b[o], b[o + 1]])
+}
+
+fn u32_at(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+
+/// `(fmt chunk payload, data chunk payload)` of a RIFF/WAVE container.
+fn riff_chunks(data: &[u8]) -> Result<(&[u8], &[u8])> {
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        bail!("not a RIFF/WAVE file");
+    }
+    let mut pos = 12;
+    let mut fmt = None;
+    let mut pcm = None;
+    while pos + 8 <= data.len() {
+        let id = &data[pos..pos + 4];
+        let size = u32_at(data, pos + 4) as usize;
+        let start = pos + 8;
+        let end = start.checked_add(size).filter(|&e| e <= data.len()).context("wem: truncated chunk")?;
+        match id {
+            b"fmt " => fmt = Some(&data[start..end]),
+            b"data" => pcm = Some(&data[start..end]),
+            _ => {}
+        }
+        pos = end + (size & 1);
+    }
+    Ok((fmt.context("wem: no fmt chunk")?, pcm.context("wem: no data chunk")?))
+}
+
+/// Codec name for a wem, for messages and for deciding whether it can be previewed.
+pub fn codec_name(data: &[u8]) -> &'static str {
+    match riff_chunks(data).ok().map(|(fmt, _)| if fmt.len() >= 2 { u16_at(fmt, 0) } else { 0 }) {
+        Some(0xFFFF) => "Wwise Vorbis",
+        Some(0xFFFE) | Some(0x0001) => "PCM",
+        Some(0x0002) => "Wwise ADPCM",
+        Some(0x3040) | Some(0x3041) => "Wwise Opus",
+        Some(0xFFFC) | Some(0xFFFD) => "Wwise XMA/AAC",
+        _ => "unknown",
+    }
+}
+
+pub fn decode_wem(data: &[u8]) -> Result<DecodedAudio> {
+    let (fmt, pcm) = riff_chunks(data)?;
+    if fmt.len() < 16 {
+        bail!("wem: fmt chunk too short");
+    }
+    let tag = u16_at(fmt, 0);
+    let channels = u16_at(fmt, 2);
+    let sample_rate = u32_at(fmt, 4);
+    let bits = u16_at(fmt, 14);
+    match tag {
+        0xFFFF => decode_vorbis(data),
+        0xFFFE | 0x0001 => {
+            if bits != 16 {
+                bail!("wem: {bits}-bit PCM is not supported");
+            }
+            if channels == 0 || sample_rate == 0 {
+                bail!("wem: invalid PCM header");
+            }
+            let samples = pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+            Ok(DecodedAudio { channels, sample_rate, samples })
+        }
+        _ => bail!("wem: {} audio cannot be previewed yet", codec_name(data)),
+    }
+}
+
+fn convert_to_ogg(data: &[u8], aotuv: bool) -> Result<Vec<u8>> {
+    let codebooks = if aotuv { ww2ogg::CodebookLibrary::aotuv_codebooks() } else { ww2ogg::CodebookLibrary::default_codebooks() }
+        .map_err(|e| anyhow::anyhow!("ww2ogg codebooks: {e:?}"))?;
+    let mut converter = ww2ogg::WwiseRiffVorbis::new(Cursor::new(data.to_vec()), codebooks)
+        .map_err(|e| anyhow::anyhow!("ww2ogg: {e:?}"))?;
+    let mut ogg = Vec::with_capacity(data.len() + data.len() / 2);
+    converter.generate_ogg(&mut ogg).map_err(|e| anyhow::anyhow!("ww2ogg: {e:?}"))?;
+    ww2ogg::validate(&ogg).map_err(|e| anyhow::anyhow!("ww2ogg validation: {e:?}"))?;
+    Ok(ogg)
+}
+
+fn decode_vorbis(data: &[u8]) -> Result<DecodedAudio> {
+    let ogg = convert_to_ogg(data, false).or_else(|first| convert_to_ogg(data, true).map_err(|_| first))?;
+    let decoder = rodio::Decoder::new_vorbis(Cursor::new(ogg)).context("decoding Ogg Vorbis")?;
+    let channels = decoder.channels();
+    let sample_rate = decoder.sample_rate();
+    let samples: Vec<i16> = decoder.collect();
+    if samples.is_empty() {
+        bail!("wem: decoded no audio");
+    }
+    Ok(DecodedAudio { channels, sample_rate, samples })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pcm_wem(tag: u16, channels: u16, rate: u32, bits: u16, samples: &[i16]) -> Vec<u8> {
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&tag.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        fmt.extend_from_slice(&(rate * channels as u32 * 2).to_le_bytes());
+        fmt.extend_from_slice(&(channels * 2).to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+        fmt.extend_from_slice(&[6, 0, 0, 0, 2, 0x31, 0, 0]); // cbSize + Wwise extras
+        let mut pcm = Vec::new();
+        for s in samples {
+            pcm.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"JUNK");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&[1, 2, 3, 0]); // odd chunk + pad byte
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        out.extend_from_slice(&fmt);
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+        out.extend_from_slice(&pcm);
+        let len = (out.len() - 8) as u32;
+        out[4..8].copy_from_slice(&len.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn decodes_pcm_wems_and_reports_codecs() {
+        let wem = pcm_wem(0xFFFE, 2, 48_000, 16, &[1, -1, 2, -2, 3, -3]);
+        assert_eq!(codec_name(&wem), "PCM");
+        let audio = decode_wem(&wem).unwrap();
+        assert_eq!((audio.channels, audio.sample_rate), (2, 48_000));
+        assert_eq!(audio.samples, vec![1, -1, 2, -2, 3, -3]);
+        assert_eq!(audio.duration(), Duration::from_secs_f64(3.0 / 48_000.0));
+
+        let adpcm = pcm_wem(0x0002, 1, 44_100, 4, &[0]);
+        assert_eq!(codec_name(&adpcm), "Wwise ADPCM");
+        assert!(decode_wem(&adpcm).unwrap_err().to_string().contains("ADPCM"));
+        assert!(decode_wem(b"not a wem").is_err());
+        assert_eq!(codec_name(&pcm_wem(0xFFFF, 1, 44_100, 16, &[])), "Wwise Vorbis");
+    }
+
+    /// Extracts `ui_menu_ok` from a real install and decodes it. Run with
+    /// `OBLIVION_REMASTERED_ROOT=<root> cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn decodes_a_real_vorbis_wem_from_the_game() {
+        let root = std::env::var_os("OBLIVION_REMASTERED_ROOT").expect("OBLIVION_REMASTERED_ROOT");
+        let paks = std::path::PathBuf::from(root).join("OblivionRemastered").join("Content").join("Paks");
+        let pak_path = std::fs::read_dir(&paks)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x == "pak") && !p.to_string_lossy().ends_with("_P.pak"))
+            .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .expect("main pak");
+        let index = crate::pak::PakIndex::read(&pak_path, |rel| rel == "Media/523823143.wem").unwrap();
+        let entry = index.entries.get("Media/523823143.wem").expect("ui_menu_ok wem");
+        let mut file = std::io::BufReader::new(std::fs::File::open(&pak_path).unwrap());
+        let bytes = index.read_entry(&mut file, entry, &mut crate::oodle::Oodle::new()).unwrap();
+        assert_eq!(codec_name(&bytes), "Wwise Vorbis");
+        let audio = decode_wem(&bytes).unwrap();
+        assert_eq!((audio.channels, audio.sample_rate), (2, 44_100));
+        assert!((1.9..2.2).contains(&audio.duration().as_secs_f64()), "{:?}", audio.duration());
+    }
+}

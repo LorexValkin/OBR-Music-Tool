@@ -1,0 +1,19 @@
+# Builds assets/sfx_index.bin + assets/sfx_index.tsv (the embedded sound index) from an
+# Oblivion Remastered install:
+#   cargo run --release --manifest-path tools/sfxindex/Cargo.toml -- "<game root>" --out assets
+# Add --check to verify the committed files are up to date without writing.
+#
+# This crate is the only place Oodle decompression (oozextract) is linked; the
+# application never reads the game's containers.
+[package]
+name = "sfxindex"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+oozextract = "0.5.5"
+
+[profile.release]
+opt-level = 3

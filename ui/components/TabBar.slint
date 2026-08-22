@@ -1,0 +1,93 @@
+import { Theme } from "../theme.slint";
+
+export struct TabInfo {
+    label: string,
+    short-label: string,
+    queued: int,
+    available: bool,
+}
+
+// Segmented tab strip. `queued` shows a badge with the number of sounds queued in that tab.
+export component TabBar inherits Rectangle {
+    in property <[TabInfo]> tabs;
+    in-out property <int> current: 0;
+    in property <bool> enabled: true;
+    callback selected(int);
+
+    height: 36px;
+    vertical-stretch: 0;
+    background: Theme.surface-muted;
+    border-color: Theme.border;
+    border-width: 1px;
+    border-radius: 4px;
+
+    HorizontalLayout {
+        padding: 3px;
+        spacing: 2px;
+
+        for tab[i] in root.tabs : Rectangle {
+            horizontal-stretch: 1;
+            border-radius: 3px;
+            background: i == root.current ? Theme.surface-raised
+                : touch.has-hover ? Theme.action-hover
+                : transparent;
+            animate background { duration: 120ms; }
+            accessible-role: button;
+            accessible-label: tab.label;
+            accessible-action-default => {
+                root.current = i;
+                root.selected(i);
+            }
+
+            HorizontalLayout {
+                alignment: center;
+                spacing: 5px;
+                padding-left: 6px;
+                padding-right: 6px;
+
+                Text {
+                    text: tab.short-label;
+                    color: !tab.available ? Theme.text-muted.transparentize(0.45)
+                        : i == root.current ? Theme.text-primary
+                        : Theme.text-muted;
+                    font-size: 11px;
+                    font-weight: i == root.current ? 700 : 600;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                if tab.queued > 0 : Rectangle {
+                    width: 20px;
+                    height: 16px;
+                    border-radius: 8px;
+                    background: Theme.warning;
+
+                    Text {
+                        text: "" + tab.queued;
+                        color: #000000;
+                        font-size: 10px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            Rectangle {
+                x: 4px;
+                y: parent.height - 2px;
+                width: parent.width - 8px;
+                height: 2px;
+                background: i == root.current ? Theme.focus-ring : transparent;
+            }
+
+            touch := TouchArea {
+                enabled: root.enabled;
+                clicked => {
+                    root.current = i;
+                    root.selected(i);
+                }
+            }
+        }
+    }
+}

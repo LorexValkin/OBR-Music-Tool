@@ -1,8 +1,8 @@
 [package]
 name = "obr-music-tool"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 edition = "2021"
-description = "Replace and add music tracks for Oblivion Remastered"
+description = "Replace music and sound effects in Oblivion Remastered"
 license-file = "LICENSE"
 publish = false
 default-run = "obr-music-tool"
@@ -20,6 +20,8 @@ mp3-duration = "0.1"
 rodio = { version = "0.20", default-features = false, features = ["mp3", "vorbis", "flac", "wav"] }
 slint = { version = "=1.12.1", default-features = false, features = ["accessibility", "backend-winit", "compat-1-2", "renderer-femtovg", "std"] }
 walkdir = "2"
+ww2ogg = "0.1.0"
+oozextract = "0.5.5"
 winreg = "0.56"
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 

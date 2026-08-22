@@ -1,8 +1,9 @@
 # OBR Music Tool
 
-Replace the music in **The Elder Scrolls IV: Oblivion Remastered** with your own tracks.
-Pick a song for any of the game's 28 music tracks, click one button, and play. No Unreal Engine,
-no hex editing, no hand-built soundbanks. Everything runs locally on your PC.
+Replace the music **and sound effects** in **The Elder Scrolls IV: Oblivion Remastered** with your own audio.
+Pick a file for any of the game's 28 music tracks or ~1,190 sound effects (doors and chests, weapons, spells,
+creatures, menus, ambience, weather...), click one button, and play. No Unreal Engine, no hex editing, no
+hand-built soundbanks. Everything runs locally on your PC.
 
 ![OBR Music Tool](docs/screenshot-2026-08-21.png)
 
@@ -12,11 +13,24 @@ Get the latest build from the [Releases page](https://github.com/LorexValkin/OBR
 anywhere and run `obr-music-tool.exe`; there is no installer and no admin rights are needed. Current builds are
 **alpha** releases, so keep a copy of your playlist and report anything odd with the Activity log attached.
 
+**About the signature.** Release builds are code-signed with the certificate of Computer Works, the developer's
+company, so Windows can verify the file came from us and was not tampered with. That is all the signature means:
+OBR Music Tool is still a free, open-source hobby project by Lorex under the [OBR Music Tool License](LICENSE),
+not a commercial product. A brand-new build may still get a SmartScreen "unrecognized app" prompt (click *More
+info* > *Run anyway*) until it builds up download reputation, and a lone antivirus hit on VirusTotal from a
+machine-learning engine is a false positive. The source is right here if you would rather build it yourself.
+
 Before converting audio you will need Wwise Authoring installed once; see [Installing Wwise](#installing-wwise).
 
 ## What it does
 
-- **Lists every vanilla music track**: Battle, Dungeon, Explore, Public (towns) and Special (title screen, death, success), with built-in preview playback so you know which track you are replacing.
+- **Lists every vanilla music track and sound effect** in tabs: Music, Menu & UI, Weapons, Magic, Creatures,
+  Player & NPC, Doors/Chests/Traps, Environment & Weather and Cinematics, with a search box for each tab. Sounds
+  carry the game's own names (for example `obj_drs_chest_open`, source file `al_obj_drs_chest_open.wav`), so you are
+  never guessing from numeric ids. Tabs show 50 sounds per page; the search box covers the whole tab.
+- **Previews everything.** Music plays from the game's loose mp3s; sound effects are read straight out of the
+  game's pak (read-only) and decoded in the app. Sounds with several *variations* expand so each variation can be
+  previewed or replaced on its own.
 - **Accepts normal audio files** as replacements: `.mp3`, `.wav`, `.ogg`, `.flac` (or pre-encoded `.wem`).
 - **Converts them to the game's format** (Wwise Vorbis `.wem`) using Audiokinetic's own encoder, so the output is exactly what the game expects.
 - **Builds a UE5 patch `.pak`** that overrides the original tracks. Your game files are never modified; delete the pak and everything is vanilla again.
@@ -26,7 +40,9 @@ Before converting audio you will need Wwise Authoring installed once; see [Insta
   - **Package release ZIP**: produces a ready-to-upload mod archive (pak in the standard `~mods` layout plus a generated `README.txt` listing the replaced tracks). The zip's file name becomes the mod's name.
 - **Saves playlists**: a small `.obrplaylist` file remembers which audio file goes on which track, so you can reopen a mod later, swap a few songs and rebuild without redoing the rest.
 
-> **Scope:** the tool *replaces* the existing 28 tracks. Adding brand-new tracks to the playlist is not supported, because which tracks play (and when) is defined inside the game's Wwise soundbanks, not by the audio files. Future updates will attempt to add support for adding more music to the playlist.
+> **Scope:** the tool *replaces* existing sounds. Adding brand-new tracks or sounds is not supported, because which
+> sounds play (and when) is defined inside the game's Wwise soundbanks, not by the audio files. The **Dialogue** tab
+> (voice lines) is coming in a later update.
 
 ## Requirements
 
@@ -75,9 +91,20 @@ You can uninstall Wwise from the Launcher at any time; only the `.wem` conversio
 1. **Launch `obr-music-tool.exe`.** The game folder is detected automatically (Steam registry, Steam
    libraries, Game Pass). If not, click **Find game** or paste the install folder into the field.
 2. **Check the Setup panel.** Both *Game installation* and *Wwise Authoring* should be green.
-3. **Choose your tracks.** In the inventory, click **Play** to hear the original, then **Replace** to pick
-   an audio file for it. Queued tracks show the chosen file name in orange; **Remove** un-queues one and
-   **Clear all** resets everything. Replacement tracks can be any length, sample rate or channel layout.
+3. **Choose your sounds.** Pick a tab at the top of the inventory (Music, Menu & UI, Weapons, ...) and use the
+   search box to filter it; searching matches the sound name, its group and its source file name, across the whole
+   tab (the list shows 50 sounds per page). Click **Play** to hear the original; sound effects are read straight from
+   the game files. Click **Replace** to pick an audio file for a sound. A sound with *N variations* (random
+   alternatives the game picks from) gets the same file on all of them; click the small arrow next to its name to
+   list the variations and play, replace or remove each one individually (the sound then shows as *partial* until
+   every variation is replaced). Queued sounds show the chosen file name in orange and a badge on their tab;
+   **Remove** un-queues one and **Clear all** resets everything. Replacement audio can be any length, sample rate
+   or channel layout.
+
+   Some sounds *share audio* with others (one menu click is used by 90 different actions); the app says so when
+   you replace one of them, and the other sounds then show as *partial* or *replace* too. A few weapon-impact
+   sounds are marked *may not replace cleanly*: their soundbank embeds its own copy of the audio, so the
+   replacement might only partly take effect in-game.
 4. **Produce the output:**
    - **Build & install PAK** writes `OblivionRemastered\Content\Paks\zzz_MusicMod_P.pak` into your game.
      Start the game and the new music is live.
@@ -105,14 +132,41 @@ with one click if you need to report a problem.
 
 ## How it works
 
-1. Each of the 28 tracks is mapped to the numeric Wwise media ID the game uses for it.
+1. Every sound (28 music tracks and ~1,200 effects, ~5,700 audio files) is mapped to the numeric Wwise media
+   ids the game uses for it by an index that ships inside the exe (`assets/sfx_index.bin`). The index is built
+   offline from the game files by `tools/sfxindex`, which reads the cooked Wwise event assets: they name the
+   event, its `Media/<id>.wem` files and the original source `.wav` each one was made from.
 2. Your audio is decoded to 16-bit PCM WAV (pre-encoded `.wem` files are copied as-is).
 3. `WwiseConsole.exe` converts the WAV with the *Vorbis Quality High* preset inside a throwaway Wwise
-   project in `%TEMP%\obr-music-wem`.
+   project in `%TEMP%\obr-music-wem`. Each source file is encoded once, however many sounds it is assigned to.
 4. The resulting `.wem` files are written into a UE5 (v11) pak at
-   `OblivionRemastered/Content/WwiseAudio/Media/<id>.wem` with the standard `../../../` mount point.
+   `OblivionRemastered/Content/WwiseAudio/Media/<id>.wem` with the standard `../../../` mount point, one entry per
+   replaced audio file (so a 3-variation sound becomes 3 entries).
+6. Preview reads the original `.wem` out of the game's main pak (read-only; Oodle-compressed entries are
+   decompressed with [oozextract](https://crates.io/crates/oozextract)), rebuilds Wwise Vorbis into a standard Ogg
+   stream with [ww2ogg](https://crates.io/crates/ww2ogg) and plays it back in the app.
 5. Because the file name ends in `_P`, Unreal loads it as a patch pak and it takes priority over the
    original media, which is why the replacement works without touching the game's soundbanks.
+
+## What is in each tab
+
+| Tab | Contents | Sounds |
+|---|---|---|
+| Music | The 28 music tracks (table below) | 28 |
+| Menu & UI | Menus, HUD, item pickup/equip, lockpicking and other minigames, volume-slider test sounds | 230 |
+| Weapons | Melee impacts, blocks, swings, bows and weapon equip/inventory sounds | 52 |
+| Magic | Spell casts, impacts, barriers and effects by school | 70 |
+| Creatures | Every creature's vocals, footsteps and foley, grouped by creature | 336 |
+| Player & NPC | Character footsteps, foley (eating, torches, swimming...) and vocal efforts | 31 |
+| Doors, Chests & Traps | Doors and gates, containers, traps | 210 |
+| Environment & Weather | Ambience beds, object emitters (fires, waterfalls, chimes...), weather, crowds, physics impacts | 240 |
+| Cinematics | Intro logos, Emperor's death, endgame | 16 |
+| Other | Controller haptics and test beeps | 5 |
+| Dialogue | Voice lines; coming in a later update | - |
+
+Counts are sounds (events); many have several variations, ~5,700 audio files in total. Every sound that carries
+audio is listed somewhere; the only things left out are engine objects without audio (buses, mixer settings, "stop"
+events).
 
 ## Track list
 
@@ -132,7 +186,11 @@ with one click if you need to report a problem.
 | *WwiseConsole conversion failed* | Make sure the **Windows** deployment platform was included in the Wwise install. Try re-saving the source as `.wav`; confirm the file plays in a normal media player. |
 | Build succeeds but the music is unchanged in-game | Confirm the pak is in `OblivionRemastered\Content\Paks` (or `Paks\~mods`) and its name ends with `_P.pak`. Remove other music mods that replace the same tracks. |
 | Game not detected | Click **Find game** and pick the install folder, the one that contains `OblivionRemastered` and `Engine`. You can also set `OBLIVION_REMASTERED_ROOT`. |
-| Preview says *packed inside IoStore* | That track has no loose `.mp3` in your install, so it cannot be previewed. Replacing it still works. |
+| A music track has no Play button / the log says it cannot be played | That track has no loose `.mp3` in your install, so it cannot be previewed. Replacing it still works. |
+| Play on a sound effect says it cannot be previewed | Connect the game folder first; previews are read from the game's pak. A handful of sounds use codecs the app cannot decode yet (Wwise ADPCM / Opus); replacing them still works. |
+| Replacing one sound changed others too | Those sounds share the same audio file inside the game (the app notes this when you replace them). Removing the replacement on any of them clears it for all. |
+| A weapon impact only partly changed in-game | Its soundbank embeds a copy of the audio; the app marks such sounds *may not replace cleanly*. Replacing the loose file cannot change the embedded copy. |
+| The tool shows a sound that no longer exists after a game update | The sound index is built from a specific game version; rebuild it with `tools/sfxindex` (see below) or wait for an update. |
 
 ## Building from source
 
@@ -146,6 +204,22 @@ cargo build --release
 
 The executable is written to `target\release\obr-music-tool.exe`. Run `cargo test` for the unit tests.
 
+### Regenerating the sound index
+
+`assets/sfx_index.bin` (and its readable twin `assets/sfx_index.tsv`) list every replaceable sound with its tab,
+group, Wwise media ids and source file name. They are generated from an installed copy of the game and committed,
+so building the app never needs the game. After a game update, rebuild them with:
+
+```
+cargo run --release --manifest-path tools/sfxindex/Cargo.toml -- "D:\SteamLibrary\steamapps\common\Oblivion Remastered" --out assets
+```
+
+Any install root works (Steam or Game Pass, any drive); the tool finds the `Paks` folder itself. Add `--check` to
+verify the committed files are still up to date without writing. `cargo test --manifest-path tools/sfxindex/Cargo.toml`
+runs the builder's own tests, including a golden test over the committed `.tsv`. Both the app (sound preview) and
+the builder decompress Oodle with the pure-Rust [oozextract](https://crates.io/crates/oozextract); the app only ever
+reads the game's pak and never modifies it.
+
 The app icon lives in `ui/assets/icon.svg`; the `icon.png` (window icon) and `icon.ico` (exe icon) next to it
 are generated from it with:
 
@@ -154,7 +228,24 @@ cargo run --release --manifest-path tools/icongen/Cargo.toml -- ui/assets/icon.s
 ```
 
 Built with [Slint](https://slint.dev) (UI), [repak](https://github.com/trumank/repak) (pak writer),
-[rodio](https://github.com/RustAudio/rodio) (audio decoding and preview) and [zip](https://github.com/zip-rs/zip2).
+[rodio](https://github.com/RustAudio/rodio) (audio decoding and preview), [zip](https://github.com/zip-rs/zip2),
+[oozextract](https://github.com/lvlvllvlvllvlvl/oozextract) (Oodle decompression) and
+[ww2ogg](https://github.com/coconutbird/ww2ogg-rs) (Wwise Vorbis to Ogg).
+
+### Releasing
+
+Releases are built and code-signed by the [Release workflow](.github/workflows/release.yml). Bump `version` in
+`Cargo.toml`, commit, then tag and push:
+
+```
+git tag v0.1.0-alpha.2
+git push --tags
+```
+
+The workflow runs the tests, builds, signs `obr-music-tool.exe` with the Computer Works certificate through Azure
+Artifact Signing (GitHub's OIDC token, no stored secrets), verifies the signature and opens a **draft** release
+with the zip, the bare exe and a `SHA256SUMS.txt`. Review the draft and publish it. The one-time Azure/GitHub
+wiring is `tools\setup-ci-signing.ps1`; `tools\sign-release.ps1` does the same build-sign-package locally.
 
 ## Legal
 

@@ -1,3 +1,6 @@
 /target
 /tools/icongen/target
 /promo
+/dist
+
+/tools/sfxindex/target

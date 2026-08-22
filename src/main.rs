@@ -2,7 +2,10 @@
 
 use anyhow::{Context, Result, bail};
 use rodio::{Decoder, OutputStream, Sink, Source};
-use slint::{ComponentHandle, Model, Timer, TimerMode};
+use slint::{ComponentHandle, Model, ModelNotify, ModelTracker, Timer, TimerMode};
+use sfx_index::Wem;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -11,10 +14,18 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+#[allow(dead_code)]
 mod iostore;
+mod oodle;
+#[allow(dead_code)]
+mod pak;
+#[allow(dead_code)]
+mod sfx_index;
 mod wem;
+mod wem_decode;
 mod wem_encoder;
 
+use sfx_index::{SfxIndex, TabKind};
 use wem_encoder::find_wwise_cli;
 
 slint::include_modules!();
@@ -25,8 +36,11 @@ const KOFI_URL: &str = "https://ko-fi.com/lorex_";
 const MUSIC_REL: &str = r"OblivionRemastered\Content\Dev\ObvData\Data\Music";
 const PAKS_REL: &str = r"OblivionRemastered\Content\Paks";
 
+/// Music tracks keep a loose `.mp3` twin in the game files, which the app uses
+/// for in-app preview. Everything else about a track (name, category, wem id)
+/// comes from the embedded sound index.
 struct WwiseTrack {
-    wwise_id: u64,
+    wwise_id: u32,
     category: &'static str,
     display_name: &'static str,
     mp3_filename: &'static str,
@@ -68,6 +82,14 @@ const WWISE_TRACKS: &[WwiseTrack] = &[
     WwiseTrack { wwise_id: 231494450,  category: "Special", display_name: "Success",         mp3_filename: "success.mp3" },
 ];
 
+fn music_track(wem_id: u32) -> Option<&'static WwiseTrack> {
+    WWISE_TRACKS.iter().find(|wt| wt.wwise_id == wem_id)
+}
+
+/// Position in the music table (keeps the Music tab in its traditional order).
+fn music_position(wem_id: u32) -> usize {
+    WWISE_TRACKS.iter().position(|wt| wt.wwise_id == wem_id).unwrap_or(usize::MAX)
+}
 
 // ---------------------------------------------------------------------------
 // Game detection
@@ -172,23 +194,8 @@ fn find_game_install() -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// Music scanning
+// Music preview files
 // ---------------------------------------------------------------------------
-
-struct TrackInfo {
-    category: String,
-    filename: String,
-    size: Option<u64>,
-    status: TrackStatus,
-    disk_path: Option<PathBuf>,
-}
-
-#[derive(Clone, PartialEq)]
-enum TrackStatus {
-    Vanilla,
-    Replaced,
-    Added,
-}
 
 fn human_size(bytes: u64) -> String {
     if bytes >= 1_048_576 {
@@ -200,58 +207,17 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-fn scan_tracks(game_root: &Path) -> Vec<TrackInfo> {
+/// Loose `.mp3` twins of the music tracks (wem id -> path, size), used for preview.
+fn scan_music_files(game_root: &Path) -> HashMap<u32, (PathBuf, u64)> {
     let music_dir = game_root.join(MUSIC_REL);
-    let staging = staging_dir();
-
     WWISE_TRACKS
         .iter()
-        .map(|wt| {
-            let staged_wem = staging.join(format!("{}.wem", wt.wwise_id));
-            let retail_mp3 = music_dir.join(wt.category).join(wt.mp3_filename);
-
-            let (status, size, disk_path) = if staged_wem.is_file() {
-                let sz = fs::metadata(&staged_wem).map(|m| m.len()).ok();
-                (TrackStatus::Replaced, sz, None)
-            } else if retail_mp3.is_file() {
-                let sz = fs::metadata(&retail_mp3).map(|m| m.len()).ok();
-                (TrackStatus::Vanilla, sz, Some(retail_mp3))
-            } else {
-                (TrackStatus::Vanilla, None, None)
-            };
-
-            TrackInfo {
-                category: wt.category.to_string(),
-                filename: wt.display_name.to_string(),
-                size,
-                status,
-                disk_path,
-            }
+        .filter_map(|wt| {
+            let path = music_dir.join(wt.category).join(wt.mp3_filename);
+            let meta = fs::metadata(&path).ok()?;
+            meta.is_file().then(|| (wt.wwise_id, (path, meta.len())))
         })
         .collect()
-}
-
-fn tracks_to_model(tracks: &[TrackInfo]) -> slint::ModelRc<TrackEntry> {
-    let entries: Vec<TrackEntry> = tracks
-        .iter()
-        .map(|t| TrackEntry {
-            category: t.category.clone().into(),
-            filename: t.filename.clone().into(),
-            size: match t.size {
-                Some(bytes) => human_size(bytes),
-                None => "packed".to_string(),
-            }
-            .into(),
-            status: match t.status {
-                TrackStatus::Vanilla => "vanilla",
-                TrackStatus::Replaced => "replace",
-                TrackStatus::Added => "added",
-            }
-            .into(),
-            replacement: Default::default(),
-        })
-        .collect();
-    slint::ModelRc::new(slint::VecModel::from(entries))
 }
 
 // ---------------------------------------------------------------------------
@@ -274,10 +240,22 @@ fn export_warning_marker() -> PathBuf {
     app_data_dir().join("export-warning-acknowledged")
 }
 
-fn stage_wem(wwise_id: u64, source: &Path) -> Result<()> {
-    let staging = staging_dir();
-    fs::create_dir_all(&staging)?;
-    let dest = staging.join(format!("{}.wem", wwise_id));
+/// Where a wem is staged: `<staging>/<id>.wem`, or `<staging>/English(US)/<id>.wem`
+/// for localised (voice) media. The relative path mirrors the game's `Media/` folder.
+fn staged_path(staging: &Path, wem_id: u32, localised: bool) -> PathBuf {
+    if localised {
+        staging.join("English(US)").join(format!("{}.wem", wem_id))
+    } else {
+        staging.join(format!("{}.wem", wem_id))
+    }
+}
+
+/// Encode (or copy, for `.wem` sources) one file into the staging folder.
+fn stage_wem(wem_id: u32, localised: bool, source: &Path) -> Result<()> {
+    let dest = staged_path(&staging_dir(), wem_id, localised);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let ext = source
         .extension()
         .and_then(|e| e.to_str())
@@ -302,14 +280,6 @@ fn stage_wem(wwise_id: u64, source: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_staged_wem(wwise_id: u64) -> Result<()> {
-    let path = staging_dir().join(format!("{}.wem", wwise_id));
-    if path.is_file() {
-        fs::remove_file(&path)?;
-    }
-    Ok(())
-}
-
 fn clear_staging() -> Result<()> {
     let dir = staging_dir();
     if dir.is_dir() {
@@ -322,22 +292,25 @@ fn clear_staging() -> Result<()> {
 // Pak builder
 // ---------------------------------------------------------------------------
 
+/// Every staged `.wem` with its path inside the pak. Subfolders of the staging
+/// directory are preserved (`English(US)/123.wem` -> `Media/English(US)/123.wem`).
 fn collect_staged_wem_files(staging: &Path) -> Vec<(String, PathBuf)> {
     let mut files = Vec::new();
     if !staging.is_dir() {
         return files;
     }
-    for entry in fs::read_dir(staging).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.to_lowercase().ends_with(".wem") {
+    for entry in walkdir::WalkDir::new(staging).min_depth(1).into_iter().flatten() {
+        if !entry.file_type().is_file() {
             continue;
         }
-        let pak_path = format!(
-            "OblivionRemastered/Content/WwiseAudio/Media/{}",
-            name
-        );
-        files.push((pak_path, entry.path()));
+        let Ok(rel) = entry.path().strip_prefix(staging) else { continue };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if !rel.to_lowercase().ends_with(".wem") {
+            continue;
+        }
+        files.push((format!("OblivionRemastered/Content/WwiseAudio/Media/{}", rel), entry.into_path()));
     }
+    files.sort();
     files
 }
 
@@ -373,6 +346,98 @@ fn format_time(secs: u64) -> String {
     let m = secs / 60;
     let s = secs % 60;
     format!("{}:{:02}", m, s)
+}
+
+// ---------------------------------------------------------------------------
+// Replacements (what the user queued), keyed by wem id
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Replacement {
+    source: PathBuf,
+    /// Index (in the sound index) of the event the user replaced to set this wem.
+    via: u32,
+}
+
+type Replacements = BTreeMap<u32, Replacement>;
+
+/// One wem to produce during a build.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QueuedWem {
+    wem_id: u32,
+    event: u32,
+    localised: bool,
+    source: PathBuf,
+}
+
+/// One line of the release README: an event that was replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplacedLine {
+    tab: String,
+    group: String,
+    name: String,
+    variations: usize,
+    source: String,
+}
+
+/// Queue every replacement for building; sorted by source so equal sources are adjacent.
+fn queued_from(replacements: &Replacements) -> Vec<QueuedWem> {
+    let index = SfxIndex::get();
+    let mut out: Vec<QueuedWem> = replacements
+        .iter()
+        .map(|(&wem_id, r)| QueuedWem {
+            wem_id,
+            event: r.via,
+            localised: index.media_by_wem(wem_id).map_or(false, |(_, w)| w.localised),
+            source: r.source.clone(),
+        })
+        .collect();
+    out.sort_by(|a, b| a.source.cmp(&b.source).then(a.wem_id.cmp(&b.wem_id)));
+    out
+}
+
+fn queued_replacements(shared: &SharedState) -> Vec<QueuedWem> {
+    queued_from(&state(shared).replacements)
+}
+
+/// Adjacent runs of the same source file: each run is encoded once and copied.
+fn group_by_source(queued: &[QueuedWem]) -> Vec<(PathBuf, Vec<QueuedWem>)> {
+    let mut groups: Vec<(PathBuf, Vec<QueuedWem>)> = Vec::new();
+    for q in queued {
+        match groups.last_mut() {
+            Some((src, items)) if *src == q.source => items.push(q.clone()),
+            _ => groups.push((q.source.clone(), vec![q.clone()])),
+        }
+    }
+    groups
+}
+
+fn event_display_name(index: &SfxIndex, event: u32) -> String {
+    index.event(event).name.to_string()
+}
+
+/// README lines for every queued event whose wems all staged successfully,
+/// in index order (which groups them by tab).
+fn replaced_lines(queued: &[QueuedWem], staged_ok: &HashSet<u32>) -> Vec<ReplacedLine> {
+    let index = SfxIndex::get();
+    let mut by_event: BTreeMap<u32, Vec<&QueuedWem>> = BTreeMap::new();
+    for q in queued {
+        by_event.entry(q.event).or_default().push(q);
+    }
+    by_event
+        .into_iter()
+        .filter(|(_, items)| items.iter().all(|q| staged_ok.contains(&q.wem_id)))
+        .map(|(event, items)| {
+            let ev = index.event(event);
+            ReplacedLine {
+                tab: index.tabs()[ev.tab as usize].name.to_string(),
+                group: index.group(ev).name.to_string(),
+                name: event_display_name(index, event),
+                variations: items.len(),
+                source: items[0].source.file_name().unwrap_or_default().to_string_lossy().to_string(),
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -412,13 +477,13 @@ fn mod_name_from_path(zip_path: &Path) -> String {
     }
 }
 
-fn release_readme(mod_name: &str, pak_name: &str, included: &[(usize, PathBuf)]) -> String {
+fn release_readme(mod_name: &str, pak_name: &str, included: &[ReplacedLine]) -> String {
     let pak_rel = format!("{}\\{}", RELEASE_PAK_DIR.replace('/', "\\"), pak_name);
     let mut lines: Vec<String> = vec![
         mod_name.to_string(),
         "=".repeat(mod_name.chars().count()),
         String::new(),
-        "Music replacement mod for The Elder Scrolls IV: Oblivion Remastered.".to_string(),
+        "Music and sound replacement mod for The Elder Scrolls IV: Oblivion Remastered.".to_string(),
         format!("Created with OBR Music Tool v{}.", VERSION),
         String::new(),
         "INSTALLATION".to_string(),
@@ -430,15 +495,23 @@ fn release_readme(mod_name: &str, pak_name: &str, included: &[(usize, PathBuf)])
         "UNINSTALL".to_string(),
         format!("  Delete {}", pak_rel),
         String::new(),
-        format!("REPLACED TRACKS ({})", included.len()),
+        format!("REPLACED SOUNDS ({})", included.len()),
     ];
-    for (idx, source) in included {
-        let wt = &WWISE_TRACKS[*idx];
-        let src = source.file_name().unwrap_or_default().to_string_lossy();
-        lines.push(format!("  {:<8} {:<14} <- {}", wt.category, wt.display_name, src));
+    let mut current_tab: Option<&str> = None;
+    for line in included {
+        if current_tab != Some(line.tab.as_str()) {
+            lines.push(format!("  {}", line.tab));
+            current_tab = Some(line.tab.as_str());
+        }
+        let name = if line.variations > 1 {
+            format!("{} ({} variations)", line.name, line.variations)
+        } else {
+            line.name.clone()
+        };
+        lines.push(format!("    {:<12} {:<32} <- {}", line.group, name, line.source));
     }
     lines.push(String::new());
-    lines.push("Only the tracks listed above are changed; everything else stays vanilla.".to_string());
+    lines.push("Only the sounds listed above are changed; everything else stays vanilla.".to_string());
     lines.push(String::new());
     lines.join("\r\n")
 }
@@ -448,7 +521,7 @@ fn write_release_zip(
     zip_path: &Path,
     mod_name: &str,
     pak_path: &Path,
-    included: &[(usize, PathBuf)],
+    included: &[ReplacedLine],
 ) -> Result<()> {
     let file = fs::File::create(zip_path)
         .with_context(|| format!("creating {}", zip_path.display()))?;
@@ -470,23 +543,35 @@ fn write_release_zip(
 }
 
 // ---------------------------------------------------------------------------
-// Playlists: which audio file goes on which track, so a mod can be reopened
+// Playlists: which audio file goes on which sound, so a mod can be reopened
 // and tweaked later. Plain text, keyed by Wwise id so it survives reordering.
 // ---------------------------------------------------------------------------
 
 const PLAYLIST_EXT: &str = "obrplaylist";
 const PLAYLIST_HEADER: &str = "# OBR Music Tool playlist v1";
 
-fn playlist_text(replacements: &[Option<PathBuf>]) -> String {
+fn playlist_text(replacements: &Replacements) -> String {
+    let index = SfxIndex::get();
     let mut lines = vec![
         PLAYLIST_HEADER.to_string(),
-        "# One line per replaced track: <wwise id> = <audio file path>".to_string(),
+        "# One line per replaced sound: <wwise id> = <audio file path>".to_string(),
     ];
-    for (wt, source) in WWISE_TRACKS.iter().zip(replacements) {
-        if let Some(source) = source {
-            lines.push(String::new());
-            lines.push(format!("# {} / {}", wt.category, wt.display_name));
-            lines.push(format!("{} = {}", wt.wwise_id, source.display()));
+    // Group by the event the user replaced; BTreeMap keeps index (= tab) order.
+    let mut by_event: BTreeMap<u32, Vec<(u32, &Path)>> = BTreeMap::new();
+    for (&wem_id, r) in replacements {
+        by_event.entry(r.via).or_default().push((wem_id, r.source.as_path()));
+    }
+    for (event, wems) in by_event {
+        let ev = index.event(event);
+        lines.push(String::new());
+        lines.push(format!(
+            "# {} / {} / {}",
+            index.tabs()[ev.tab as usize].name,
+            index.group(ev).name,
+            event_display_name(index, event)
+        ));
+        for (wem_id, source) in wems {
+            lines.push(format!("{} = {}", wem_id, source.display()));
         }
     }
     lines.push(String::new());
@@ -495,7 +580,7 @@ fn playlist_text(replacements: &[Option<PathBuf>]) -> String {
 
 /// Parses playlist text into `(wwise_id, path)` pairs. Unknown ids are kept so
 /// the caller can report them; comments and blank lines are ignored.
-fn parse_playlist(text: &str) -> Result<Vec<(u64, PathBuf)>> {
+fn parse_playlist(text: &str) -> Result<Vec<(u32, PathBuf)>> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut lines = text.lines().map(str::trim);
     if lines.next() != Some(PLAYLIST_HEADER) {
@@ -509,10 +594,10 @@ fn parse_playlist(text: &str) -> Result<Vec<(u64, PathBuf)>> {
         let Some((id, path)) = line.split_once('=') else {
             bail!("line {}: expected '<wwise id> = <path>'", n + 2);
         };
-        let id: u64 = id
+        let id: u32 = id
             .trim()
             .parse()
-            .with_context(|| format!("line {}: bad track id '{}'", n + 2, id.trim()))?;
+            .with_context(|| format!("line {}: bad sound id '{}'", n + 2, id.trim()))?;
         let path = path.trim();
         if path.is_empty() {
             bail!("line {}: empty path", n + 2);
@@ -522,12 +607,12 @@ fn parse_playlist(text: &str) -> Result<Vec<(u64, PathBuf)>> {
     Ok(entries)
 }
 
-fn save_playlist(path: &Path, replacements: &[Option<PathBuf>]) -> Result<()> {
+fn save_playlist(path: &Path, replacements: &Replacements) -> Result<()> {
     fs::write(path, playlist_text(replacements))
         .with_context(|| format!("writing {}", path.display()))
 }
 
-fn load_playlist(path: &Path) -> Result<Vec<(u64, PathBuf)>> {
+fn load_playlist(path: &Path) -> Result<Vec<(u32, PathBuf)>> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading {}", path.display()))?;
     parse_playlist(&text)
@@ -564,24 +649,20 @@ impl BuildTarget {
     }
 }
 
-fn queued_replacements(shared: &SharedState) -> Vec<(usize, PathBuf)> {
-    state(shared)
-        .replacements
-        .iter()
-        .enumerate()
-        .filter_map(|(i, r)| r.as_ref().map(|p| (i, p.clone())))
-        .collect()
+fn distinct_events(queued: &[QueuedWem]) -> usize {
+    queued.iter().map(|q| q.event).collect::<HashSet<_>>().len()
 }
 
-/// Encodes every queued replacement to WEM on a worker thread, then produces
-/// the requested output. UI state is updated back on the event loop.
+/// Encodes every queued replacement to WEM on a worker thread (once per distinct
+/// source file), then produces the requested output. UI state is updated back on
+/// the event loop.
 fn start_build(app: &AppWindow, shared: &SharedState, target: BuildTarget) {
-    let replacements = queued_replacements(shared);
-    if replacements.is_empty() {
+    let queued = queued_replacements(shared);
+    if queued.is_empty() {
         set_status(
             app,
             &format!("Nothing to {}", target.verb().to_lowercase()),
-            "No tracks queued.",
+            "No sounds queued.",
             Tone::Error,
         );
         return;
@@ -614,6 +695,7 @@ fn start_build(app: &AppWindow, shared: &SharedState, target: BuildTarget) {
         BuildTarget::Package { zip_path, .. } => zip_path.clone(),
     };
 
+    let groups = group_by_source(&queued);
     app.set_build_running(true);
     app.set_build_complete(false);
     app.set_encoding_active(true);
@@ -621,23 +703,21 @@ fn start_build(app: &AppWindow, shared: &SharedState, target: BuildTarget) {
     set_status(
         app,
         target.progress_label(),
-        &format!("Encoding {} track(s)...", replacements.len()),
+        &format!("Encoding {} file(s) for {} sound(s)...", groups.len(), distinct_events(&queued)),
         Tone::Warning,
     );
     append_log(app, &format!("--- {} started ---", target.progress_label()));
 
     let weak = app.as_weak();
     std::thread::spawn(move || {
-        let total = replacements.len();
+        let index = SfxIndex::get();
+        let total = groups.len();
         let staging = staging_dir();
         let _ = fs::create_dir_all(&staging);
         let mut errors = Vec::new();
-        let mut encoded: Vec<(usize, PathBuf)> = Vec::new();
+        let mut staged_ok: HashSet<u32> = HashSet::new();
 
-        for (step, (idx, source)) in replacements.iter().enumerate() {
-            let wt = &WWISE_TRACKS[*idx];
-            let dest = staging.join(format!("{}.wem", wt.wwise_id));
-
+        for (step, (source, items)) in groups.iter().enumerate() {
             let progress = (step as f32 + 0.5) / total as f32;
             let label = source.file_name().unwrap_or_default().to_string_lossy().to_string();
             let weak_p = weak.clone();
@@ -647,19 +727,36 @@ fn start_build(app: &AppWindow, shared: &SharedState, target: BuildTarget) {
                 app.set_encoding_file(label.into());
             });
 
-            let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-            let result = if ext == "wem" {
-                fs::copy(source, &dest).map(|_| ()).map_err(anyhow::Error::from)
-            } else {
-                wem::convert_to_wem(source, &dest)
+            let names = {
+                let mut seen: Vec<u32> = items.iter().map(|q| q.event).collect();
+                seen.dedup();
+                seen.iter().map(|&e| event_display_name(index, e)).collect::<Vec<_>>().join(", ")
             };
-
-            match result {
-                Ok(()) => encoded.push((*idx, source.clone())),
-                Err(e) => errors.push(format!("{}: {}", wt.display_name, e)),
+            let first = &items[0];
+            match stage_wem(first.wem_id, first.localised, source) {
+                Ok(()) => {
+                    staged_ok.insert(first.wem_id);
+                    let first_path = staged_path(&staging, first.wem_id, first.localised);
+                    for item in &items[1..] {
+                        let dest = staged_path(&staging, item.wem_id, item.localised);
+                        let copied = dest
+                            .parent()
+                            .map(fs::create_dir_all)
+                            .unwrap_or(Ok(()))
+                            .and_then(|()| fs::copy(&first_path, &dest));
+                        match copied {
+                            Ok(_) => {
+                                staged_ok.insert(item.wem_id);
+                            }
+                            Err(e) => errors.push(format!("{}: copying wem {}: {}", names, item.wem_id, e)),
+                        }
+                    }
+                }
+                Err(e) => errors.push(format!("{}: {}", names, e)),
             }
         }
 
+        let encoded = replaced_lines(&queued, &staged_ok);
         let staged_files = collect_staged_wem_files(&staging);
         let result = if staged_files.is_empty() {
             Err(anyhow::anyhow!("No WEM files produced"))
@@ -713,7 +810,7 @@ fn start_build(app: &AppWindow, shared: &SharedState, target: BuildTarget) {
                         Tone::Success
                     } else {
                         message.push_str(&format!(
-                            " {} track(s) failed to encode and were left out; see log.",
+                            " {} file(s) failed to encode and were left out; see log.",
                             errors.len()
                         ));
                         Tone::Warning
@@ -721,7 +818,7 @@ fn start_build(app: &AppWindow, shared: &SharedState, target: BuildTarget) {
                     set_status(&app, title, &message, tone);
                     append_log(
                         &app,
-                        &format!("{}: {} ({})", title, output_path.display(), human_size(sz)),
+                        &format!("{}: {} ({}, {} sound(s))", title, output_path.display(), human_size(sz), encoded.len()),
                     );
                 }
                 Err(e) => {
@@ -735,14 +832,88 @@ fn start_build(app: &AppWindow, shared: &SharedState, target: BuildTarget) {
 }
 
 // ---------------------------------------------------------------------------
-// GUI
+// Sound preview: original audio is read straight out of the game's main pak
+// (read-only) and decoded in memory.
+// ---------------------------------------------------------------------------
+
+struct PreviewPak {
+    path: PathBuf,
+    index: pak::PakIndex,
+}
+
+/// The game's main pak: the largest `.pak` in the Paks folder that is not a `_P` mod pak.
+fn find_main_pak(game_root: &Path) -> Option<PathBuf> {
+    let paks = game_root.join(PAKS_REL);
+    fs::read_dir(&paks)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            name.ends_with(".pak") && !name.ends_with("_p.pak")
+        })
+        .max_by_key(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+}
+
+fn load_preview_pak(game_root: &Path) -> Result<PreviewPak> {
+    let path = find_main_pak(game_root).context("no main .pak found in the game's Paks folder")?;
+    let index = pak::PakIndex::read(&path, |rel| {
+        rel.strip_prefix("Media/").map_or(false, |r| r.ends_with(".wem") && !r.contains('/'))
+    })
+    .with_context(|| format!("reading {}", path.display()))?;
+    Ok(PreviewPak { path, index })
+}
+
+impl PreviewPak {
+    fn extract(&self, wem_id: u32) -> Result<Vec<u8>> {
+        let entry = self
+            .index
+            .entries
+            .get(&format!("Media/{}.wem", wem_id))
+            .with_context(|| format!("wem {} is not in {}", wem_id, self.path.display()))?;
+        let mut file = BufReader::new(fs::File::open(&self.path).with_context(|| format!("opening {}", self.path.display()))?);
+        self.index.read_entry(&mut file, entry, &mut oodle::Oodle::new())
+    }
+}
+
+/// Audio ready to be handed to a rodio sink.
+struct Preview {
+    source: Box<dyn Source<Item = i16> + Send>,
+    duration: Duration,
+    label: String,
+}
+
+fn preview_from_wem_bytes(bytes: &[u8], label: String) -> Result<Preview> {
+    let audio = wem_decode::decode_wem(bytes)?;
+    let duration = audio.duration();
+    Ok(Preview { source: Box::new(audio.into_source()), duration, label })
+}
+
+/// Decode a user-supplied replacement file (any accepted format) for preview.
+fn preview_from_file(path: &Path) -> Result<Preview> {
+    let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if ext == "wem" {
+        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        return preview_from_wem_bytes(&bytes, label);
+    }
+    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let decoder = Decoder::new(BufReader::new(file)).with_context(|| format!("decoding {}", path.display()))?;
+    let duration = decoder
+        .total_duration()
+        .or_else(|| if ext == "mp3" { mp3_duration::from_path(path).ok() } else { None })
+        .unwrap_or(Duration::ZERO);
+    Ok(Preview { source: Box::new(decoder), duration, label })
+}
+
+// ---------------------------------------------------------------------------
+// GUI state
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 enum Tone {
     Neutral = 0,
     Success = 1,
-    #[allow(dead_code)]
     Warning = 2,
     Error = 3,
 }
@@ -755,8 +926,11 @@ struct AudioPlayer {
 
 struct AppState {
     game_root: Option<PathBuf>,
-    track_paths: Vec<Option<PathBuf>>,
-    replacements: Vec<Option<PathBuf>>,
+    /// Loose mp3 previews for the music tracks, by wem id.
+    music_files: HashMap<u32, (PathBuf, u64)>,
+    /// Index of the game's main pak, opened on the first sound-effect preview.
+    preview_pak: Option<PreviewPak>,
+    replacements: Replacements,
     audio: Option<AudioPlayer>,
 }
 
@@ -781,79 +955,504 @@ fn append_log(app: &AppWindow, line: &str) {
     app.set_log_text(log.into());
 }
 
-fn refresh_tracks(app: &AppWindow, shared: &SharedState, game_root: &Path, model: &slint::VecModel<TrackEntry>) {
-    let tracks = scan_tracks(game_root);
-    let paths: Vec<Option<PathBuf>> = tracks.iter().map(|t| t.disk_path.clone()).collect();
+// ---------------------------------------------------------------------------
+// Inventory model: a lazy view over the sound index. Only the rows a ListView
+// actually shows are materialised; the per-row storage is one u32.
+// ---------------------------------------------------------------------------
 
-    let mut st = state(shared);
-    st.track_paths = paths;
-    let replacements = st.replacements.clone();
-    drop(st);
+/// Builds the row shown for an event from the index and the current replacements.
+fn entry_for_event(index: &SfxIndex, st: &AppState, event: u32, expanded: bool) -> TrackEntry {
+    let ev = index.event(event);
+    let kind = index.tabs()[ev.tab as usize].kind;
 
-    sync_track_model(app, &tracks, &replacements, model);
-}
-
-fn sync_track_model(app: &AppWindow, tracks: &[TrackInfo], replacements: &[Option<PathBuf>], model: &slint::VecModel<TrackEntry>) {
-    while model.row_count() > 0 {
-        model.remove(0);
+    let mut total = 0usize;
+    let mut replaced = 0usize;
+    let mut shared = 0usize;
+    let mut replacement: Option<&Replacement> = None;
+    let mut first_wem: Option<&sfx_index::Wem> = None;
+    for (wi, wem) in index.media_of(ev) {
+        total += 1;
+        first_wem.get_or_insert(wem);
+        shared = shared.max(index.events_sharing(wi).len().saturating_sub(1));
+        if let Some(r) = st.replacements.get(&wem.id) {
+            replaced += 1;
+            if replacement.map_or(true, |cur| cur.via != event && r.via == event) {
+                replacement = Some(r);
+            }
+        }
     }
-    for (i, t) in tracks.iter().enumerate() {
-        let replacement = replacements.get(i).and_then(|r| r.as_ref());
-        let (status_str, size_str, repl_str) = if let Some(src) = replacement {
-            let name = src.file_name().unwrap_or_default().to_string_lossy().to_string();
-            ("replace".to_string(), String::new(), name)
-        } else {
-            let size = match t.size {
-                Some(bytes) => human_size(bytes),
-                None => "packed".to_string(),
-            };
-            ("vanilla".to_string(), size, String::new())
+
+    let status = if replaced == 0 {
+        "vanilla"
+    } else if replaced == total {
+        "replace"
+    } else {
+        "partial"
+    };
+    let replacement_label = replacement
+        .map(|r| {
+            let file = r.source.file_name().unwrap_or_default().to_string_lossy().to_string();
+            if r.via == event {
+                file
+            } else {
+                format!("{} (via {})", file, event_display_name(index, r.via))
+            }
+        })
+        .unwrap_or_default();
+
+    let (group, name, size, detail, can_play) = if kind == TabKind::Music {
+        let wem_id = first_wem.map(|w| w.id).unwrap_or(0);
+        let mt = music_track(wem_id);
+        let group = mt.map(|t| t.category).unwrap_or(index.group(ev).name).to_string();
+        let name = mt.map(|t| t.display_name).unwrap_or(ev.name).to_string();
+        let (size, can_play) = match st.music_files.get(&wem_id) {
+            Some((_, bytes)) => (human_size(*bytes), true),
+            None => ("packed".to_string(), false),
         };
-        model.push(TrackEntry {
-            category: t.category.clone().into(),
-            filename: t.filename.clone().into(),
-            size: size_str.into(),
-            status: status_str.into(),
-            replacement: repl_str.into(),
-        });
-    }
+        (group, name, size, String::new(), can_play)
+    } else {
+        let detail = first_wem.and_then(|w| w.wav).unwrap_or("").to_string();
+        // Sound effects are previewed from the game's pak, so a connected game is enough.
+        (index.group(ev).name.to_string(), ev.name.to_string(), String::new(), detail, st.game_root.is_some())
+    };
 
-    let staged = replacements.iter().filter(|r| r.is_some()).count();
-    app.set_staged_count(staged as i32);
-    app.set_vanilla_count((WWISE_TRACKS.len() - staged) as i32);
+    TrackEntry {
+        event: event as i32,
+        kind: 0,
+        variation: 0,
+        expanded,
+        group: group.into(),
+        name: name.into(),
+        detail: detail.into(),
+        size: size.into(),
+        status: status.into(),
+        replacement: replacement_label.into(),
+        variations: total as i32,
+        shared: shared as i32,
+        warning: ev.prefetch_suspect(),
+        can_play,
+    }
 }
 
-fn try_connect_game(app: &AppWindow, shared: &SharedState, path: &str, model: &slint::VecModel<TrackEntry>) {
+/// Builds the row for one variation (wem) of an expanded event.
+fn entry_for_variation(index: &SfxIndex, st: &AppState, event: u32, variation: usize) -> TrackEntry {
+    let ev = index.event(event);
+    let (wi, wem): (u32, &Wem) = index.media_of(ev).nth(variation).unwrap_or_else(|| index.media_of(ev).next().expect("event without media"));
+    let replacement = st.replacements.get(&wem.id);
+    let status = if replacement.is_some() { "replace" } else { "vanilla" };
+    let replacement_label = replacement
+        .map(|r| {
+            let file = r.source.file_name().unwrap_or_default().to_string_lossy().to_string();
+            if r.via == event { file } else { format!("{} (via {})", file, event_display_name(index, r.via)) }
+        })
+        .unwrap_or_default();
+    TrackEntry {
+        event: event as i32,
+        kind: 1,
+        variation: variation as i32 + 1,
+        expanded: false,
+        group: format!("variation {}", variation + 1).into(),
+        name: wem.wav.map(str::to_string).unwrap_or_else(|| format!("wem {}", wem.id)).into(),
+        detail: format!("id {}", wem.id).into(),
+        size: String::new().into(),
+        status: status.into(),
+        replacement: replacement_label.into(),
+        variations: 1,
+        shared: index.events_sharing(wi).len().saturating_sub(1) as i32,
+        warning: false,
+        can_play: st.game_root.is_some() || replacement.is_some(),
+    }
+}
+
+/// Sounds shown per page of a tab.
+const PAGE_SIZE: usize = 50;
+
+/// Row references are packed into a `u32`: plain event index for sound rows,
+/// `ROW_VARIATION | event << 16 | variation` for the rows of an expanded sound.
+const ROW_VARIATION: u32 = 0x8000_0000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowRef {
+    Event(u32),
+    Variation { event: u32, index: usize },
+}
+
+fn row_ref(row: u32) -> RowRef {
+    if row & ROW_VARIATION != 0 {
+        RowRef::Variation { event: (row >> 16) & 0x7fff, index: (row & 0xffff) as usize }
+    } else {
+        RowRef::Event(row)
+    }
+}
+
+fn variation_row(event: u32, index: usize) -> u32 {
+    ROW_VARIATION | (event << 16) | (index as u32 & 0xffff)
+}
+
+impl RowRef {
+    fn event(self) -> u32 {
+        match self {
+            RowRef::Event(e) | RowRef::Variation { event: e, .. } => e,
+        }
+    }
+}
+
+struct InventoryModel {
+    shared: SharedState,
+    /// Events of the current tab matching the search, in display order.
+    filtered: RefCell<Vec<u32>>,
+    /// Rows of the current page (events plus the variations of expanded ones).
+    rows: RefCell<Vec<u32>>,
+    page: Cell<usize>,
+    tab: Cell<usize>,
+    expanded: RefCell<HashSet<u32>>,
+    notify: ModelNotify,
+}
+
+impl InventoryModel {
+    fn new(shared: SharedState) -> InventoryModel {
+        InventoryModel {
+            shared,
+            filtered: RefCell::new(Vec::new()),
+            rows: RefCell::new(Vec::new()),
+            page: Cell::new(0),
+            tab: Cell::new(0),
+            expanded: RefCell::new(HashSet::new()),
+            notify: ModelNotify::default(),
+        }
+    }
+
+    /// Show the events of `tab` matching `query` (page 1). Never called while the state lock is held.
+    fn set_view(&self, tab: usize, query: &str) {
+        let index = SfxIndex::get();
+        let tab = tab.min(index.tabs().len().saturating_sub(1));
+        let mut filtered = index.search(tab, query);
+        if index.tabs()[tab].kind == TabKind::Music {
+            filtered.sort_by_key(|&e| {
+                index.media_of(index.event(e)).next().map(|(_, w)| music_position(w.id)).unwrap_or(usize::MAX)
+            });
+        }
+        if self.tab.get() != tab {
+            self.expanded.borrow_mut().clear();
+        }
+        *self.filtered.borrow_mut() = filtered;
+        self.tab.set(tab);
+        self.page.set(0);
+        self.rebuild();
+    }
+
+    fn filtered_len(&self) -> usize {
+        self.filtered.borrow().len()
+    }
+
+    fn page(&self) -> usize {
+        self.page.get()
+    }
+
+    fn page_count(&self) -> usize {
+        (self.filtered_len() + PAGE_SIZE - 1) / PAGE_SIZE
+    }
+
+    /// 1-based `(first, last)` sound numbers shown on the current page.
+    fn page_bounds(&self) -> (usize, usize) {
+        let total = self.filtered_len();
+        if total == 0 {
+            return (0, 0);
+        }
+        let first = self.page() * PAGE_SIZE;
+        (first + 1, (first + PAGE_SIZE).min(total))
+    }
+
+    fn set_page(&self, page: usize) {
+        let page = page.min(self.page_count().saturating_sub(1));
+        if page != self.page.get() {
+            self.page.set(page);
+            self.rebuild();
+        }
+    }
+
+    fn toggle_expand(&self, event: u32) {
+        {
+            let mut expanded = self.expanded.borrow_mut();
+            if !expanded.remove(&event) {
+                expanded.insert(event);
+            }
+        }
+        self.rebuild();
+    }
+
+    fn is_expanded(&self, event: u32) -> bool {
+        self.expanded.borrow().contains(&event)
+    }
+
+    /// Rebuild the page's rows from `filtered` and the expanded set, then reset the view.
+    fn rebuild(&self) {
+        let index = SfxIndex::get();
+        let filtered = self.filtered.borrow();
+        let expanded = self.expanded.borrow();
+        let start = (self.page.get() * PAGE_SIZE).min(filtered.len());
+        let end = (start + PAGE_SIZE).min(filtered.len());
+        let mut rows = Vec::with_capacity(end - start + 8);
+        for &ev in &filtered[start..end] {
+            rows.push(ev);
+            if expanded.contains(&ev) {
+                for i in 0..index.event(ev).media_count() {
+                    rows.push(variation_row(ev, i));
+                }
+            }
+        }
+        drop(filtered);
+        drop(expanded);
+        *self.rows.borrow_mut() = rows;
+        self.notify.reset();
+    }
+
+    /// Re-fetch every visible row (replacements or preview files changed broadly).
+    fn refresh(&self) {
+        self.notify.reset();
+    }
+
+    /// Re-fetch the rows (sound and variation rows) of the given events, if visible.
+    fn invalidate_events(&self, events: &[u32]) {
+        let rows = self.rows.borrow();
+        for (pos, &row) in rows.iter().enumerate() {
+            if events.contains(&row_ref(row).event()) {
+                self.notify.row_changed(pos);
+            }
+        }
+    }
+}
+
+impl Model for InventoryModel {
+    type Data = TrackEntry;
+
+    fn row_count(&self) -> usize {
+        self.rows.borrow().len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<TrackEntry> {
+        let row = *self.rows.borrow().get(row)?;
+        let index = SfxIndex::get();
+        let st = state(&self.shared);
+        Some(match row_ref(row) {
+            RowRef::Event(ev) => entry_for_event(index, &st, ev, self.is_expanded(ev)),
+            RowRef::Variation { event, index: i } => entry_for_variation(index, &st, event, i),
+        })
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &self.notify
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+/// Push the model's paging state into the window properties.
+fn sync_page_props(app: &AppWindow, model: &InventoryModel) {
+    let (first, last) = model.page_bounds();
+    app.set_tab_total(model.filtered_len() as i32);
+    app.set_page_index(model.page() as i32);
+    app.set_page_count(model.page_count() as i32);
+    app.set_page_first(first as i32);
+    app.set_page_last(last as i32);
+}
+
+fn tab_info(tab: &sfx_index::Tab, queued: usize) -> TabInfo {
+    TabInfo {
+        label: tab.name.into(),
+        short_label: tab.kind.short_label().into(),
+        queued: queued as i32,
+        available: tab.kind.available(),
+    }
+}
+
+/// Recompute the queued counters (total and per tab). Cheap: one pass over the map.
+fn update_counts(app: &AppWindow, shared: &SharedState, tabs: &slint::VecModel<TabInfo>) {
+    let index = SfxIndex::get();
+    let events: HashSet<u32> = state(shared).replacements.values().map(|r| r.via).collect();
+    let mut per_tab = vec![0usize; index.tabs().len()];
+    for ev in &events {
+        per_tab[index.event(*ev).tab as usize] += 1;
+    }
+    app.set_staged_count(events.len() as i32);
+    for (i, tab) in index.tabs().iter().enumerate() {
+        let info = tab_info(tab, per_tab[i]);
+        if tabs.row_data(i).map_or(true, |cur| cur.queued != info.queued) {
+            tabs.set_row_data(i, info);
+        }
+    }
+}
+
+/// Events affected by a change to `event`: itself plus every event sharing one of its wems.
+fn affected_events(index: &SfxIndex, event: u32) -> Vec<u32> {
+    let ev = index.event(event);
+    let mut out = vec![event];
+    for (wi, _) in index.media_of(ev) {
+        out.extend_from_slice(index.events_sharing(wi));
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn refresh_inventory(app: &AppWindow, shared: &SharedState, model: &InventoryModel, tabs: &slint::VecModel<TabInfo>) {
+    model.refresh();
+    sync_page_props(app, model);
+    update_counts(app, shared, tabs);
+}
+
+fn try_connect_game(app: &AppWindow, shared: &SharedState, path: &str, model: &InventoryModel, tabs: &slint::VecModel<TabInfo>) {
     let path = Path::new(path);
     match validate_game_install(path) {
         Some(root) => {
-            state(shared).game_root = Some(root.clone());
+            let music = scan_music_files(&root);
+            let previewable = music.len();
+            {
+                let mut st = state(shared);
+                st.game_root = Some(root.clone());
+                st.music_files = music;
+                st.preview_pak = None;
+            }
             app.set_game_valid(true);
             app.set_game_status("Game folder validated. Music directory found.".into());
             app.set_game_tone(Tone::Success as i32);
             app.set_game_path(root.to_string_lossy().to_string().into());
             append_log(app, &format!("Connected to: {}", root.display()));
-            refresh_tracks(app, shared, &root, model);
+            refresh_inventory(app, shared, model, tabs);
             set_status(
                 app,
                 "Connected",
                 &format!(
-                    "{} vanilla tracks found. Stage replacements or add new tracks.",
-                    app.get_vanilla_count()
+                    "{} of {} music tracks can be previewed. Pick a tab and replace sounds.",
+                    previewable,
+                    WWISE_TRACKS.len()
                 ),
                 Tone::Success,
             );
         }
         None => {
-            state(shared).game_root = None;
+            {
+                let mut st = state(shared);
+                st.game_root = None;
+                st.music_files.clear();
+                st.preview_pak = None;
+            }
             app.set_game_valid(false);
             app.set_game_status("Music directory not found at that path.".into());
             app.set_game_tone(Tone::Error as i32);
-            while model.row_count() > 0 { model.remove(0); }
-            app.set_staged_count(0);
-            app.set_vanilla_count(0);
+            refresh_inventory(app, shared, model, tabs);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Playback
+// ---------------------------------------------------------------------------
+
+/// Build the preview for `event` (`variation` is 1-based, or -1 for the sound's
+/// first audio file): the queued replacement if there is one, the loose mp3 for
+/// music, otherwise the original audio extracted from the game's pak.
+fn load_preview(shared: &SharedState, event: u32, variation: i32) -> Result<Preview> {
+    let index = SfxIndex::get();
+    let ev = index.event(event);
+    let which = if variation >= 1 { variation as usize - 1 } else { 0 };
+    let (_, wem) = index.media_of(ev).nth(which).context("no such variation")?;
+    let name = event_display_name(index, event);
+    let label = if ev.media_count() > 1 { format!("{} (variation {})", name, which + 1) } else { name };
+
+    let mut st = state(shared);
+    if let Some(r) = st.replacements.get(&wem.id) {
+        let source = r.source.clone();
+        drop(st);
+        let mut p = preview_from_file(&source)?;
+        p.label = format!("{} <- {}", label, p.label);
+        return Ok(p);
+    }
+    if let Some((path, _)) = st.music_files.get(&wem.id) {
+        let path = path.clone();
+        drop(st);
+        return preview_from_file(&path);
+    }
+    let Some(root) = st.game_root.clone() else {
+        bail!("connect the game folder first to preview sound effects");
+    };
+    if st.preview_pak.is_none() {
+        st.preview_pak = Some(load_preview_pak(&root)?);
+    }
+    let bytes = st.preview_pak.as_ref().unwrap().extract(wem.id)?;
+    drop(st);
+    preview_from_wem_bytes(&bytes, label)
+}
+
+fn play_sound(app: &AppWindow, shared: &SharedState, timer: &Rc<Timer>, event: i32, variation: i32) {
+    let index = SfxIndex::get();
+    if event < 0 || event as usize >= index.events().len() {
+        return;
+    }
+    state(shared).audio = None;
+    app.set_playing_event(-1);
+    app.set_playing_variation(-1);
+
+    let preview = match load_preview(shared, event as u32, variation) {
+        Ok(p) => p,
+        Err(e) => {
+            append_log(app, &format!("Cannot play {}: {:#}", event_display_name(index, event as u32), e));
+            set_status(app, "Cannot play", &format!("{:#}", e), Tone::Warning);
+            return;
+        }
+    };
+
+    let (stream, stream_handle) = match OutputStream::try_default() {
+        Ok(pair) => pair,
+        Err(e) => {
+            append_log(app, &format!("Audio output error: {}", e));
+            return;
+        }
+    };
+    let sink = match Sink::try_new(&stream_handle) {
+        Ok(s) => s,
+        Err(e) => {
+            append_log(app, &format!("Audio sink error: {}", e));
+            return;
+        }
+    };
+    sink.append(preview.source);
+    let total_duration = preview.duration;
+    state(shared).audio = Some(AudioPlayer { _stream: stream, sink, total_duration });
+
+    app.set_playing_event(event);
+    app.set_playing_variation(variation);
+    app.set_playing_filename(preview.label.clone().into());
+    app.set_playing_paused(false);
+    app.set_playing_progress(0.0);
+    app.set_playing_position_text("0:00".into());
+    app.set_playing_duration_text(format_time(total_duration.as_secs()).into());
+    append_log(app, &format!("Playing: {}", preview.label));
+
+    let weak_timer = app.as_weak();
+    let shared_timer = shared.clone();
+    timer.start(TimerMode::Repeated, Duration::from_millis(200), move || {
+        let Some(app) = weak_timer.upgrade() else { return };
+        let st = state(&shared_timer);
+        if let Some(audio) = &st.audio {
+            if audio.sink.empty() {
+                drop(st);
+                state(&shared_timer).audio = None;
+                app.set_playing_event(-1);
+                app.set_playing_variation(-1);
+                app.set_playing_progress(0.0);
+                app.set_playing_position_text("0:00".into());
+                return;
+            }
+            let pos = audio.sink.get_pos();
+            let total = audio.total_duration;
+            let progress = if total.as_secs_f32() > 0.0 { (pos.as_secs_f32() / total.as_secs_f32()).min(1.0) } else { 0.0 };
+            app.set_playing_progress(progress);
+            app.set_playing_position_text(format_time(pos.as_secs()).into());
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -866,8 +1465,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let shared: SharedState = Arc::new(Mutex::new(AppState {
         game_root: None,
-        track_paths: Vec::new(),
-        replacements: vec![None; WWISE_TRACKS.len()],
+        music_files: HashMap::new(),
+        preview_pak: None,
+        replacements: BTreeMap::new(),
         audio: None,
     }));
 
@@ -886,22 +1486,36 @@ fn main() -> Result<(), slint::PlatformError> {
         app.set_wwise_tone(Tone::Error as i32);
     }
 
-    let track_model = Rc::new(slint::VecModel::<TrackEntry>::default());
-    app.set_track_list(slint::ModelRc::from(track_model.clone()));
+    let index = SfxIndex::get();
+    let tabs_model = Rc::new(slint::VecModel::from(
+        index.tabs().iter().map(|t| tab_info(t, 0)).collect::<Vec<_>>(),
+    ));
+    app.set_tabs(slint::ModelRc::from(tabs_model.clone()));
+
+    let model = Rc::new(InventoryModel::new(shared.clone()));
+    app.set_track_list(slint::ModelRc::from(model.clone()));
+    model.set_view(0, "");
+    app.set_current_tab(0);
+    sync_page_props(&app, &model);
+    append_log(
+        &app,
+        &format!("Sound index: {} sounds in {} tabs.", index.events().len(), index.tabs().iter().filter(|t| t.kind.available()).count()),
+    );
 
     if let Some(root) = find_game_install() {
         let app_ref = app.as_weak().unwrap();
-        try_connect_game(&app_ref, &shared, &root.to_string_lossy(), &track_model);
+        try_connect_game(&app_ref, &shared, &root.to_string_lossy(), &model, &tabs_model);
     }
 
     {
         let weak = app.as_weak();
         let shared = shared.clone();
-        let model = track_model.clone();
+        let model = model.clone();
+        let tabs = tabs_model.clone();
         app.on_find_game(move || {
             let Some(app) = weak.upgrade() else { return };
             if let Some(root) = find_game_install() {
-                try_connect_game(&app, &shared, &root.to_string_lossy(), &model);
+                try_connect_game(&app, &shared, &root.to_string_lossy(), &model, &tabs);
             } else {
                 app.set_game_status("Could not auto-detect game. Browse manually.".into());
                 app.set_game_tone(Tone::Warning as i32);
@@ -911,7 +1525,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     .set_title("Choose Oblivion Remastered folder")
                     .pick_folder()
                 {
-                    try_connect_game(&app, &shared, &folder.to_string_lossy(), &model);
+                    try_connect_game(&app, &shared, &folder.to_string_lossy(), &model, &tabs);
                 }
             }
         });
@@ -920,45 +1534,112 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = app.as_weak();
         let shared = shared.clone();
-        let model = track_model.clone();
+        let model = model.clone();
+        let tabs = tabs_model.clone();
         app.on_game_path_edited(move || {
             let Some(app) = weak.upgrade() else { return };
             let path = app.get_game_path().to_string();
             if !path.is_empty() {
-                try_connect_game(&app, &shared, &path, &model);
+                try_connect_game(&app, &shared, &path, &model, &tabs);
             }
         });
     }
 
     {
         let weak = app.as_weak();
-        let shared = shared.clone();
-        let model = track_model.clone();
-        app.on_replace_track(move |index| {
+        let model = model.clone();
+        app.on_tab_selected(move |tab| {
             let Some(app) = weak.upgrade() else { return };
-            let idx = index as usize;
-            let Some(wt) = WWISE_TRACKS.get(idx) else { return };
+            let tab = tab.max(0) as usize;
+            model.set_view(tab, &app.get_search_text());
+            app.set_current_tab(tab as i32);
+            sync_page_props(&app, &model);
+        });
+    }
+
+    let search_timer = Rc::new(Timer::default());
+    {
+        let weak = app.as_weak();
+        let model = model.clone();
+        let timer = search_timer.clone();
+        app.on_search_changed(move || {
+            let weak = weak.clone();
+            let model = model.clone();
+            // Debounce so typing quickly does not rebuild the view on every key.
+            timer.start(TimerMode::SingleShot, Duration::from_millis(150), move || {
+                let Some(app) = weak.upgrade() else { return };
+                model.set_view(app.get_current_tab().max(0) as usize, &app.get_search_text());
+                sync_page_props(&app, &model);
+            });
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let shared = shared.clone();
+        let model = model.clone();
+        let tabs = tabs_model.clone();
+        app.on_replace_track(move |event| {
+            let Some(app) = weak.upgrade() else { return };
+            let index = SfxIndex::get();
+            if event < 0 || event as usize >= index.events().len() {
+                return;
+            }
+            let event = event as u32;
+            let ev = index.event(event);
+            let name = event_display_name(index, event);
+            let tab_name = index.tabs()[ev.tab as usize].name;
 
             let dialog = rfd::FileDialog::new()
-                .set_title(format!("Replace {} ({})", wt.display_name, wt.category))
+                .set_title(format!("Replace {} ({})", name, tab_name))
                 .add_filter("Audio Files", &["mp3", "wav", "ogg", "flac", "wem"]);
 
-            if let Some(source) = dialog.pick_file() {
-                let fname = source.file_name().unwrap_or_default().to_string_lossy().to_string();
-                state(&shared).replacements[idx] = Some(source);
+            let Some(source) = dialog.pick_file() else { return };
+            let fname = source.file_name().unwrap_or_default().to_string_lossy().to_string();
 
-                if let Some(mut entry) = model.row_data(idx) {
-                    entry.status = "replace".into();
-                    entry.replacement = fname.clone().into();
-                    entry.size = Default::default();
-                    model.set_row_data(idx, entry);
+            let mut overridden: Vec<String> = Vec::new();
+            let mut shared_notes: Vec<String> = Vec::new();
+            {
+                let mut st = state(&shared);
+                for (wi, wem) in index.media_of(ev) {
+                    let others = index.events_sharing(wi).len().saturating_sub(1);
+                    if others > 0 {
+                        shared_notes.push(format!(
+                            "{} is shared with {} other sound{}",
+                            wem.wav.unwrap_or("this sound"),
+                            others,
+                            if others == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if let Some(prev) = st.replacements.insert(wem.id, Replacement { source: source.clone(), via: event }) {
+                        if prev.via != event {
+                            overridden.push(format!(
+                                "{} (previously set on {})",
+                                prev.source.file_name().unwrap_or_default().to_string_lossy(),
+                                event_display_name(index, prev.via)
+                            ));
+                        }
+                    }
                 }
-                let count = state(&shared).replacements.iter().filter(|r| r.is_some()).count();
-                app.set_staged_count(count as i32);
-                app.set_vanilla_count((WWISE_TRACKS.len() - count) as i32);
+            }
+            model.invalidate_events(&affected_events(index, event));
+            update_counts(&app, &shared, &tabs);
 
-                append_log(&app, &format!("Queued: {} <- {}", wt.display_name, fname));
-                set_status(&app, "Ready", &format!("{} queued for replacement.", wt.display_name), Tone::Success);
+            let variations = ev.media_count();
+            append_log(&app, &format!("Queued: {} <- {}{}", name, fname, if variations > 1 { format!(" ({} variations)", variations) } else { String::new() }));
+            for o in &overridden {
+                append_log(&app, &format!("  overrides {}", o));
+            }
+            for s in &shared_notes {
+                append_log(&app, &format!("  note: {}; those change too", s));
+            }
+            if ev.prefetch_suspect() {
+                append_log(&app, "  note: this sound's bank may embed a copy of the audio; the replacement might not take full effect in-game");
+            }
+            if let Some(first) = shared_notes.first() {
+                set_status(&app, "Queued with a note", &format!("{} queued. {}; they change too.", name, first), Tone::Warning);
+            } else {
+                set_status(&app, "Ready", &format!("{} queued for replacement.", name), Tone::Success);
             }
         });
     }
@@ -966,36 +1647,132 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = app.as_weak();
         let shared = shared.clone();
-        let model = track_model.clone();
-        app.on_remove_staged(move |index| {
+        let model = model.clone();
+        let tabs = tabs_model.clone();
+        app.on_remove_staged(move |event| {
             let Some(app) = weak.upgrade() else { return };
-            let idx = index as usize;
-            let Some(wt) = WWISE_TRACKS.get(idx) else { return };
-
-            state(&shared).replacements[idx] = None;
-
-            if let Some(mut entry) = model.row_data(idx) {
-                entry.status = "vanilla".into();
-                entry.replacement = Default::default();
-                model.set_row_data(idx, entry);
+            let index = SfxIndex::get();
+            if event < 0 || event as usize >= index.events().len() {
+                return;
             }
-            let count = state(&shared).replacements.iter().filter(|r| r.is_some()).count();
-            app.set_staged_count(count as i32);
-            app.set_vanilla_count((WWISE_TRACKS.len() - count) as i32);
+            let event = event as u32;
+            let ev = index.event(event);
+            let name = event_display_name(index, event);
 
-            append_log(&app, &format!("Removed: {}", wt.display_name));
-            set_status(&app, "Ready", &format!("{} replacement cleared.", wt.display_name), Tone::Neutral);
+            let mut cleared_elsewhere: Vec<String> = Vec::new();
+            {
+                let mut st = state(&shared);
+                for (_, wem) in index.media_of(ev) {
+                    if let Some(prev) = st.replacements.remove(&wem.id) {
+                        if prev.via != event {
+                            cleared_elsewhere.push(event_display_name(index, prev.via));
+                        }
+                    }
+                }
+            }
+            cleared_elsewhere.sort();
+            cleared_elsewhere.dedup();
+            model.invalidate_events(&affected_events(index, event));
+            update_counts(&app, &shared, &tabs);
+
+            append_log(&app, &format!("Removed: {}", name));
+            if !cleared_elsewhere.is_empty() {
+                append_log(&app, &format!("  also cleared shared audio set on {}", cleared_elsewhere.join(", ")));
+            }
+            set_status(&app, "Ready", &format!("{} replacement cleared.", name), Tone::Neutral);
         });
     }
 
     {
         let weak = app.as_weak();
-        app.on_add_track(move || {
+        let model = model.clone();
+        app.on_prev_page(move || {
             let Some(app) = weak.upgrade() else { return };
-            append_log(
-                &app,
-                "Adding new tracks is not supported for Wwise audio. You can only replace existing vanilla tracks.",
-            );
+            model.set_page(model.page().saturating_sub(1));
+            sync_page_props(&app, &model);
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let model = model.clone();
+        app.on_next_page(move || {
+            let Some(app) = weak.upgrade() else { return };
+            model.set_page(model.page() + 1);
+            sync_page_props(&app, &model);
+        });
+    }
+
+    {
+        let model = model.clone();
+        app.on_toggle_expand(move |event| {
+            if event >= 0 && (event as usize) < SfxIndex::get().events().len() {
+                model.toggle_expand(event as u32);
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let shared = shared.clone();
+        let model = model.clone();
+        let tabs = tabs_model.clone();
+        app.on_replace_variation(move |event, variation| {
+            let Some(app) = weak.upgrade() else { return };
+            let index = SfxIndex::get();
+            if event < 0 || event as usize >= index.events().len() || variation < 1 {
+                return;
+            }
+            let event = event as u32;
+            let ev = index.event(event);
+            let Some((wi, wem)) = index.media_of(ev).nth(variation as usize - 1) else { return };
+            let name = event_display_name(index, event);
+            let wav = wem.wav.unwrap_or("");
+            let dialog = rfd::FileDialog::new()
+                .set_title(format!("Replace {} - variation {} ({})", name, variation, if wav.is_empty() { "no source name" } else { wav }))
+                .add_filter("Audio Files", &["mp3", "wav", "ogg", "flac", "wem"]);
+            let Some(source) = dialog.pick_file() else { return };
+            let fname = source.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let others = index.events_sharing(wi).len().saturating_sub(1);
+            let prev = state(&shared).replacements.insert(wem.id, Replacement { source, via: event });
+            model.invalidate_events(&affected_events(index, event));
+            update_counts(&app, &shared, &tabs);
+            append_log(&app, &format!("Queued: {} variation {} <- {}", name, variation, fname));
+            if let Some(prev) = prev.filter(|p| p.via != event) {
+                append_log(&app, &format!("  overrides {} (previously set on {})", prev.source.file_name().unwrap_or_default().to_string_lossy(), event_display_name(index, prev.via)));
+            }
+            if others > 0 {
+                append_log(&app, &format!("  note: this audio is shared with {} other sound{}; they change too", others, if others == 1 { "" } else { "s" }));
+                set_status(&app, "Queued with a note", &format!("{} variation {} queued; shared with {} other sound(s).", name, variation, others), Tone::Warning);
+            } else {
+                set_status(&app, "Ready", &format!("{} variation {} queued for replacement.", name, variation), Tone::Success);
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let shared = shared.clone();
+        let model = model.clone();
+        let tabs = tabs_model.clone();
+        app.on_remove_variation(move |event, variation| {
+            let Some(app) = weak.upgrade() else { return };
+            let index = SfxIndex::get();
+            if event < 0 || event as usize >= index.events().len() || variation < 1 {
+                return;
+            }
+            let event = event as u32;
+            let ev = index.event(event);
+            let Some((_, wem)) = index.media_of(ev).nth(variation as usize - 1) else { return };
+            let removed = state(&shared).replacements.remove(&wem.id);
+            model.invalidate_events(&affected_events(index, event));
+            update_counts(&app, &shared, &tabs);
+            let name = event_display_name(index, event);
+            append_log(&app, &format!("Removed: {} variation {}", name, variation));
+            if let Some(prev) = removed.filter(|p| p.via != event) {
+                append_log(&app, &format!("  also cleared shared audio set on {}", event_display_name(index, prev.via)));
+            }
+            set_status(&app, "Ready", &format!("{} variation {} replacement cleared.", name, variation), Tone::Neutral);
         });
     }
 
@@ -1011,20 +1788,14 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = app.as_weak();
         let shared = shared.clone();
-        let model = track_model.clone();
+        let model = model.clone();
+        let tabs = tabs_model.clone();
         app.on_restore_staging(move || {
             let Some(app) = weak.upgrade() else { return };
-            {
-                let mut st = state(&shared);
-                for r in st.replacements.iter_mut() {
-                    *r = None;
-                }
-            }
+            state(&shared).replacements.clear();
             append_log(&app, "All replacements cleared.");
-            set_status(&app, "Cleared", "All queued tracks removed.", Tone::Neutral);
-            if let Some(root) = state(&shared).game_root.clone() {
-                refresh_tracks(&app, &shared, &root, &model);
-            }
+            set_status(&app, "Cleared", "All queued sounds removed.", Tone::Neutral);
+            refresh_inventory(&app, &shared, &model, &tabs);
         });
     }
 
@@ -1054,103 +1825,19 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = app.as_weak();
         let shared = shared.clone();
         let timer = playback_timer.clone();
-        app.on_play_track(move |index| {
+        app.on_play_track(move |event| {
             let Some(app) = weak.upgrade() else { return };
-            let path = {
-                let st = state(&shared);
-                st.track_paths.get(index as usize).cloned().flatten()
-            };
+            play_sound(&app, &shared, &timer, event, -1);
+        });
+    }
 
-            let Some(path) = path else {
-                append_log(
-                    &app,
-                    "Cannot play: track is packed inside IoStore (no loose file on disk).",
-                );
-                return;
-            };
-
-            state(&shared).audio = None;
-            app.set_playing_index(-1);
-
-            let file = match fs::File::open(&path) {
-                Ok(f) => f,
-                Err(e) => {
-                    append_log(&app, &format!("Cannot open {}: {}", path.display(), e));
-                    return;
-                }
-            };
-
-            let (stream, stream_handle) = match OutputStream::try_default() {
-                Ok(pair) => pair,
-                Err(e) => {
-                    append_log(&app, &format!("Audio output error: {}", e));
-                    return;
-                }
-            };
-
-            let sink = match Sink::try_new(&stream_handle) {
-                Ok(s) => s,
-                Err(e) => {
-                    append_log(&app, &format!("Audio sink error: {}", e));
-                    return;
-                }
-            };
-
-            let reader = BufReader::new(file);
-            let source = match Decoder::new(reader) {
-                Ok(s) => s,
-                Err(e) => {
-                    append_log(&app, &format!("MP3 decode error: {}", e));
-                    return;
-                }
-            };
-
-            let total_duration = source.total_duration().unwrap_or_else(|| {
-                mp3_duration::from_path(&path).unwrap_or(Duration::ZERO)
-            });
-
-            sink.append(source);
-
-            state(&shared).audio = Some(AudioPlayer {
-                _stream: stream,
-                sink,
-                total_duration,
-            });
-
-            let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            app.set_playing_index(index);
-            app.set_playing_filename(filename.clone().into());
-            app.set_playing_paused(false);
-            app.set_playing_progress(0.0);
-            app.set_playing_position_text("0:00".into());
-            app.set_playing_duration_text(format_time(total_duration.as_secs()).into());
-            append_log(&app, &format!("Playing: {}", filename));
-
-            let weak_timer = app.as_weak();
-            let shared_timer = shared.clone();
-            timer.start(TimerMode::Repeated, Duration::from_millis(200), move || {
-                let Some(app) = weak_timer.upgrade() else { return };
-                let st = state(&shared_timer);
-                if let Some(audio) = &st.audio {
-                    if audio.sink.empty() {
-                        drop(st);
-                        state(&shared_timer).audio = None;
-                        app.set_playing_index(-1);
-                        app.set_playing_progress(0.0);
-                        app.set_playing_position_text("0:00".into());
-                        return;
-                    }
-                    let pos = audio.sink.get_pos();
-                    let total = audio.total_duration;
-                    let progress = if total.as_secs_f32() > 0.0 {
-                        (pos.as_secs_f32() / total.as_secs_f32()).min(1.0)
-                    } else {
-                        0.0
-                    };
-                    app.set_playing_progress(progress);
-                    app.set_playing_position_text(format_time(pos.as_secs()).into());
-                }
-            });
+    {
+        let weak = app.as_weak();
+        let shared = shared.clone();
+        let timer = playback_timer.clone();
+        app.on_play_variation(move |event, variation| {
+            let Some(app) = weak.upgrade() else { return };
+            play_sound(&app, &shared, &timer, event, variation);
         });
     }
 
@@ -1161,7 +1848,8 @@ fn main() -> Result<(), slint::PlatformError> {
         app.on_stop_playback(move || {
             let Some(app) = weak.upgrade() else { return };
             state(&shared).audio = None;
-            app.set_playing_index(-1);
+            app.set_playing_event(-1);
+            app.set_playing_variation(-1);
             app.set_playing_progress(0.0);
             app.set_playing_position_text("0:00".into());
             app.set_playing_paused(false);
@@ -1263,12 +1951,12 @@ fn main() -> Result<(), slint::PlatformError> {
         app.on_export_pak(move || {
             let Some(app) = weak.upgrade() else { return };
             if queued_replacements(&shared).is_empty() {
-                set_status(&app, "Nothing to export", "No tracks queued.", Tone::Error);
+                set_status(&app, "Nothing to export", "No sounds queued.", Tone::Error);
                 return;
             }
 
             let Some(path) = rfd::FileDialog::new()
-                .set_title("Export music mod PAK")
+                .set_title("Export sound mod PAK")
                 .set_file_name("MusicMod_P.pak")
                 .add_filter("UE5 PAK", &["pak"])
                 .save_file()
@@ -1286,7 +1974,7 @@ fn main() -> Result<(), slint::PlatformError> {
         app.on_package_mod(move || {
             let Some(app) = weak.upgrade() else { return };
             if queued_replacements(&shared).is_empty() {
-                set_status(&app, "Nothing to package", "No tracks queued.", Tone::Error);
+                set_status(&app, "Nothing to package", "No sounds queued.", Tone::Error);
                 return;
             }
 
@@ -1335,9 +2023,9 @@ fn main() -> Result<(), slint::PlatformError> {
         app.on_save_playlist(move || {
             let Some(app) = weak.upgrade() else { return };
             let replacements = state(&shared).replacements.clone();
-            let count = replacements.iter().filter(|r| r.is_some()).count();
+            let count = replacements.values().map(|r| r.via).collect::<HashSet<_>>().len();
             if count == 0 {
-                set_status(&app, "Nothing to save", "No tracks queued.", Tone::Error);
+                set_status(&app, "Nothing to save", "No sounds queued.", Tone::Error);
                 return;
             }
 
@@ -1357,7 +2045,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     set_status(
                         &app,
                         "Playlist saved",
-                        &format!("{} track(s) saved to {}.", count, name),
+                        &format!("{} sound(s) saved to {}.", count, name),
                         Tone::Success,
                     );
                     append_log(&app, &format!("Playlist saved: {}", path.display()));
@@ -1373,19 +2061,10 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = app.as_weak();
         let shared = shared.clone();
-        let model = track_model.clone();
+        let model = model.clone();
+        let tabs = tabs_model.clone();
         app.on_load_playlist(move || {
             let Some(app) = weak.upgrade() else { return };
-            let Some(game_root) = state(&shared).game_root.clone() else {
-                set_status(
-                    &app,
-                    "No game folder",
-                    "Connect the game folder before opening a playlist.",
-                    Tone::Error,
-                );
-                return;
-            };
-
             let Some(path) = rfd::FileDialog::new()
                 .set_title("Open playlist")
                 .add_filter("OBR Music Tool playlist", &[PLAYLIST_EXT])
@@ -1403,43 +2082,47 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             };
 
-            let mut loaded = 0usize;
+            let index = SfxIndex::get();
             let mut skipped = Vec::new();
+            let mut loaded_events: HashSet<u32> = HashSet::new();
             {
                 let mut st = state(&shared);
-                for r in st.replacements.iter_mut() {
-                    *r = None;
-                }
+                st.replacements.clear();
                 for (id, source) in entries {
-                    let Some(idx) = WWISE_TRACKS.iter().position(|wt| wt.wwise_id == id) else {
-                        skipped.push(format!("unknown track id {}", id));
+                    let Some((wi, _)) = index.media_by_wem(id) else {
+                        skipped.push(format!("unknown sound id {}", id));
+                        continue;
+                    };
+                    let Some(via) = index.primary_event_of_wem(wi) else {
+                        skipped.push(format!("sound id {} is not used by any event", id));
                         continue;
                     };
                     if !source.is_file() {
                         skipped.push(format!(
                             "{}: file not found: {}",
-                            WWISE_TRACKS[idx].display_name,
+                            event_display_name(index, via),
                             source.display()
                         ));
                         continue;
                     }
-                    st.replacements[idx] = Some(source);
-                    loaded += 1;
+                    st.replacements.insert(id, Replacement { source, via });
+                    loaded_events.insert(via);
                 }
             }
-            refresh_tracks(&app, &shared, &game_root, &model);
+            refresh_inventory(&app, &shared, &model, &tabs);
 
-            append_log(&app, &format!("Playlist opened: {} ({} track(s))", path.display(), loaded));
+            let loaded = loaded_events.len();
+            append_log(&app, &format!("Playlist opened: {} ({} sound(s))", path.display(), loaded));
             for s in &skipped {
                 append_log(&app, &format!("Skipped: {}", s));
             }
             if skipped.is_empty() {
-                set_status(&app, "Playlist opened", &format!("{} track(s) queued.", loaded), Tone::Success);
+                set_status(&app, "Playlist opened", &format!("{} sound(s) queued.", loaded), Tone::Success);
             } else {
                 set_status(
                     &app,
                     "Playlist opened",
-                    &format!("{} track(s) queued; {} skipped (see log).", loaded, skipped.len()),
+                    &format!("{} sound(s) queued; {} skipped (see log).", loaded, skipped.len()),
                     Tone::Warning,
                 );
             }
@@ -1469,6 +2152,25 @@ mod tests {
     use super::*;
     use std::io::Read;
 
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("obr-music-tool-test-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn event_named(name: &str) -> u32 {
+        let index = SfxIndex::get();
+        index.events().iter().position(|e| e.name == name).unwrap_or_else(|| panic!("no event {name}")) as u32
+    }
+
+    fn replace_event(replacements: &mut Replacements, event: u32, source: &str) {
+        let index = SfxIndex::get();
+        for (_, wem) in index.media_of(index.event(event)) {
+            replacements.insert(wem.id, Replacement { source: PathBuf::from(source), via: event });
+        }
+    }
+
     #[test]
     fn ensure_extension_appends_only_when_missing() {
         assert_eq!(ensure_extension(PathBuf::from(r"C:\x\Mod"), "zip"), PathBuf::from(r"C:\x\Mod.zip"));
@@ -1486,13 +2188,56 @@ mod tests {
     }
 
     #[test]
-    fn release_zip_contains_pak_in_mods_layout_and_readme() {
-        let dir = std::env::temp_dir().join(format!("obr-music-tool-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+    fn music_tracks_map_onto_index_music_tab() {
+        let index = SfxIndex::get();
+        let music = index.tab_index(TabKind::Music).unwrap();
+        for wt in WWISE_TRACKS {
+            let (wi, _) = index.media_by_wem(wt.wwise_id).unwrap_or_else(|| panic!("{} missing from index", wt.display_name));
+            let ev = index.event(index.primary_event_of_wem(wi).unwrap());
+            assert_eq!(ev.tab as usize, music, "{} is not in the Music tab", wt.display_name);
+            assert_eq!(ev.name, wt.display_name);
+            assert_eq!(index.group(ev).name, wt.category);
+        }
+        assert_eq!(index.events_in_tab(music).len(), WWISE_TRACKS.len());
+    }
+
+    #[test]
+    fn queued_replacements_group_same_source_and_keep_all_wems() {
+        let mut replacements = Replacements::new();
+        let ok = event_named("ui_menu_ok");
+        let cancel = event_named("ui_menu_cancel");
+        let chest = event_named("obj_drs_chest_open");
+        replace_event(&mut replacements, ok, r"C:\sfx\click.wav");
+        replace_event(&mut replacements, cancel, r"C:\sfx\click.wav");
+        replace_event(&mut replacements, chest, r"C:\sfx\creak.wav");
+        let queued = queued_from(&replacements);
+        assert_eq!(queued.len(), replacements.len());
+        let groups = group_by_source(&queued);
+        assert_eq!(groups.len(), 2);
+        let click = groups.iter().find(|(s, _)| s == Path::new(r"C:\sfx\click.wav")).unwrap();
+        assert_eq!(click.1.len(), 2);
+        assert_eq!(distinct_events(&queued), 3);
+
+        let all: HashSet<u32> = queued.iter().map(|q| q.wem_id).collect();
+        let lines = replaced_lines(&queued, &all);
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().any(|l| l.name == "obj_drs_chest_open" && l.tab == "Doors, Chests & Traps" && l.source == "creak.wav"));
+        // A partially failed event is left out of the README.
+        let mut partial = all.clone();
+        partial.remove(&queued.iter().find(|q| q.event == chest).unwrap().wem_id);
+        assert_eq!(replaced_lines(&queued, &partial).len(), 2);
+    }
+
+    #[test]
+    fn release_zip_contains_pak_in_mods_layout_and_readme_grouped_by_tab() {
+        let dir = temp_dir("zip");
         let pak_path = dir.join("Epic Music_P.pak");
         fs::write(&pak_path, b"not really a pak").unwrap();
         let zip_path = dir.join("Epic Music.zip");
-        let included = vec![(0usize, PathBuf::from(r"C:\songs\my battle song.mp3"))];
+        let included = vec![
+            ReplacedLine { tab: "Music".into(), group: "Battle".into(), name: "Battle 01".into(), variations: 1, source: "my battle song.mp3".into() },
+            ReplacedLine { tab: "Doors, Chests & Traps".into(), group: "Containers".into(), name: "obj_drs_chest_open".into(), variations: 3, source: "creak.wav".into() },
+        ];
 
         write_release_zip(&zip_path, "Epic Music", &pak_path, &included).unwrap();
 
@@ -1521,21 +2266,27 @@ mod tests {
         archive.by_name("README.txt").unwrap().read_to_string(&mut readme).unwrap();
         assert!(readme.starts_with("Epic Music\r\n==========\r\n"), "{readme}");
         assert!(readme.contains(r"OblivionRemastered\Content\Paks\~mods\Epic Music_P.pak"), "{readme}");
-        assert!(readme.contains("REPLACED TRACKS (1)"), "{readme}");
-        assert!(readme.contains("Battle   Battle 01      <- my battle song.mp3"), "{readme}");
+        assert!(readme.contains("REPLACED SOUNDS (2)"), "{readme}");
+        let battle = format!("  Music\r\n    {:<12} {:<32} <- {}", "Battle", "Battle 01", "my battle song.mp3");
+        let chest = format!("  Doors, Chests & Traps\r\n    {:<12} {:<32} <- {}", "Containers", "obj_drs_chest_open (3 variations)", "creak.wav");
+        assert!(readme.contains(&battle), "{readme}");
+        assert!(readme.contains(&chest), "{readme}");
+        assert!(readme.find("  Music").unwrap() < readme.find("  Doors, Chests").unwrap());
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn playlist_round_trips_and_tolerates_hand_edits() {
-        let mut replacements: Vec<Option<PathBuf>> = vec![None; WWISE_TRACKS.len()];
-        replacements[0] = Some(PathBuf::from(r"C:\songs\battle.mp3"));
-        replacements[27] = Some(PathBuf::from(r"D:\music\win = yes.flac"));
+        let mut replacements = Replacements::new();
+        let battle = event_named("Battle 01");
+        let success = event_named("Success");
+        replace_event(&mut replacements, battle, r"C:\songs\battle.mp3");
+        replace_event(&mut replacements, success, r"D:\music\win = yes.flac");
 
         let text = playlist_text(&replacements);
         assert!(text.starts_with(PLAYLIST_HEADER), "{text}");
-        assert!(text.contains("# Special / Success"), "{text}");
+        assert!(text.contains("# Music / Special / Success"), "{text}");
         assert_eq!(
             parse_playlist(&text).unwrap(),
             vec![
@@ -1550,10 +2301,159 @@ mod tests {
     }
 
     #[test]
+    fn playlist_writes_one_line_per_variation_and_round_trips() {
+        let index = SfxIndex::get();
+        let multi = index
+            .events()
+            .iter()
+            .position(|e| e.media_count() >= 3 && index.tabs()[e.tab as usize].kind == TabKind::MenuUi)
+            .unwrap() as u32;
+        let mut replacements = Replacements::new();
+        replace_event(&mut replacements, multi, r"C:\sfx\click.wav");
+        let text = playlist_text(&replacements);
+        let parsed = parse_playlist(&text).unwrap();
+        assert_eq!(parsed.len(), index.event(multi).media_count());
+        assert!(text.contains(&format!("# Menu & UI / {} / {}", index.group(index.event(multi)).name, index.event(multi).name)), "{text}");
+        let mut reloaded = Replacements::new();
+        for (id, source) in parsed {
+            let (wi, _) = index.media_by_wem(id).unwrap();
+            reloaded.insert(id, Replacement { source, via: index.primary_event_of_wem(wi).unwrap() });
+        }
+        assert_eq!(reloaded.len(), replacements.len());
+        assert!(reloaded.values().all(|r| r.source == Path::new(r"C:\sfx\click.wav")));
+    }
+
+    #[test]
     fn playlist_rejects_foreign_or_broken_files() {
         assert!(parse_playlist("just some text").is_err());
         assert!(parse_playlist(&format!("{}\r\nnot-a-number = C:\\x.mp3", PLAYLIST_HEADER)).is_err());
         assert!(parse_playlist(&format!("{}\r\n58019519 =   ", PLAYLIST_HEADER)).is_err());
         assert!(parse_playlist(&format!("{}\r\nno separator here", PLAYLIST_HEADER)).is_err());
+    }
+
+    #[test]
+    fn entry_reflects_replacements_shared_wems_and_music_previews() {
+        let index = SfxIndex::get();
+        let mut st = AppState { game_root: None, music_files: HashMap::new(), preview_pak: None, replacements: Replacements::new(), audio: None };
+
+        // Music row: name/category from the table, "packed" without a preview file.
+        let battle = event_named("Battle 01");
+        let row = entry_for_event(index, &st, battle, false);
+        assert_eq!((row.group.as_str(), row.name.as_str(), row.size.as_str(), row.status.as_str()), ("Battle", "Battle 01", "packed", "vanilla"));
+        assert!(!row.can_play);
+        st.music_files.insert(WWISE_TRACKS[0].wwise_id, (PathBuf::from(r"C:\g\battle_01.mp3"), 2_000_000));
+        let row = entry_for_event(index, &st, battle, false);
+        assert!(row.can_play);
+        assert_eq!(row.size.as_str(), "1.9 MB");
+
+        // Replacing an event that shares a wem marks the other event "partial (via ...)".
+        let (shared_wi, _) = index.wems_iter().find(|(_, w)| w.shared && w.events.len() >= 2).unwrap();
+        let sharers = index.events_sharing(shared_wi);
+        let (a, b) = (sharers[0], sharers[1]);
+        replace_event(&mut st.replacements, a, r"C:\sfx\click.wav");
+        let row_a = entry_for_event(index, &st, a, false);
+        assert_eq!(row_a.status.as_str(), "replace");
+        assert_eq!(row_a.replacement.as_str(), "click.wav");
+        assert!(row_a.shared >= 1);
+        let row_b = entry_for_event(index, &st, b, false);
+        assert!(row_b.status.as_str() == "partial" || row_b.status.as_str() == "replace", "{}", row_b.status);
+        assert!(row_b.replacement.contains("(via "), "{}", row_b.replacement);
+        assert!(affected_events(index, a).contains(&b));
+
+        // A sound effect row shows its source wav; preview needs a connected game.
+        let ok = event_named("ui_menu_ok");
+        let row = entry_for_event(index, &st, ok, false);
+        assert_eq!(row.detail.as_str(), "al_ui_menu_ok.wav");
+        assert_eq!(row.group.as_str(), "Menus");
+        assert!(!row.can_play);
+        st.game_root = Some(PathBuf::from(r"C:\game"));
+        assert!(entry_for_event(index, &st, ok, false).can_play);
+
+        // Variation rows carry the wav name and the wem id, and replace individually.
+        let multi = index.events().iter().position(|e| e.media_count() >= 3).unwrap() as u32;
+        let v2 = entry_for_variation(index, &st, multi, 1);
+        assert_eq!((v2.kind, v2.variation, v2.status.as_str()), (1, 2, "vanilla"));
+        assert!(v2.detail.starts_with("id "));
+        let (_, wem2) = index.media_of(index.event(multi)).nth(1).unwrap();
+        st.replacements.insert(wem2.id, Replacement { source: PathBuf::from(r"C:\sfx\one.wav"), via: multi });
+        assert_eq!(entry_for_variation(index, &st, multi, 1).status.as_str(), "replace");
+        assert_eq!(entry_for_variation(index, &st, multi, 0).status.as_str(), "vanilla");
+        assert_eq!(entry_for_event(index, &st, multi, false).status.as_str(), "partial");
+    }
+
+    #[test]
+    fn inventory_model_pages_and_expands() {
+        let shared: SharedState = Arc::new(Mutex::new(AppState { game_root: None, music_files: HashMap::new(), preview_pak: None, replacements: Replacements::new(), audio: None }));
+        let index = SfxIndex::get();
+        let model = InventoryModel::new(shared);
+        let creatures = index.tab_index(TabKind::Creatures).unwrap();
+        model.set_view(creatures, "");
+        let total = index.events_in_tab(creatures).len();
+        assert_eq!(model.filtered_len(), total);
+        assert_eq!(model.page_count(), (total + PAGE_SIZE - 1) / PAGE_SIZE);
+        assert_eq!(model.row_count(), PAGE_SIZE);
+        assert_eq!(model.page_bounds(), (1, PAGE_SIZE));
+
+        // Last page holds the remainder; paging past the end clamps.
+        model.set_page(999);
+        assert_eq!(model.page(), model.page_count() - 1);
+        assert_eq!(model.row_count(), total - (model.page_count() - 1) * PAGE_SIZE);
+        model.set_page(0);
+
+        // Expanding a sound inserts one row per variation right after it.
+        let first = model.row_data(0).unwrap();
+        let ev = first.event as u32;
+        let n = index.event(ev).media_count();
+        assert!(n > 1);
+        model.toggle_expand(ev);
+        assert_eq!(model.row_count(), PAGE_SIZE + n);
+        assert!(model.row_data(0).unwrap().expanded);
+        let v1 = model.row_data(1).unwrap();
+        assert_eq!((v1.kind, v1.variation, v1.event), (1, 1, ev as i32));
+        assert_eq!(model.row_data(n).unwrap().variation, n as i32);
+        assert_eq!(model.row_data(n + 1).unwrap().kind, 0);
+        model.toggle_expand(ev);
+        assert_eq!(model.row_count(), PAGE_SIZE);
+
+        // Search covers the whole tab, not just the page; switching tabs clears expansion.
+        model.set_view(creatures, "horse");
+        assert!(model.filtered_len() >= 5 && model.filtered_len() < PAGE_SIZE);
+        assert_eq!(model.page_count(), 1);
+        assert_eq!(model.page_bounds(), (1, model.filtered_len()));
+        assert_eq!(row_ref(variation_row(1234, 7)), RowRef::Variation { event: 1234, index: 7 });
+        assert_eq!(row_ref(42), RowRef::Event(42));
+    }
+
+    #[test]
+    fn staging_preserves_subfolders_and_pak_contains_one_entry_per_wem() {
+        let dir = temp_dir("pak");
+        let staging = dir.join("staging");
+        fs::create_dir_all(staging.join("English(US)")).unwrap();
+        fs::write(staged_path(&staging, 111, false), b"wem-111").unwrap();
+        fs::write(staged_path(&staging, 222, false), b"wem-222").unwrap();
+        fs::write(staged_path(&staging, 333, true), b"wem-333").unwrap();
+        fs::write(staging.join("notes.txt"), b"ignored").unwrap();
+
+        let files = collect_staged_wem_files(&staging);
+        let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "OblivionRemastered/Content/WwiseAudio/Media/111.wem",
+                "OblivionRemastered/Content/WwiseAudio/Media/222.wem",
+                "OblivionRemastered/Content/WwiseAudio/Media/English(US)/333.wem",
+            ]
+        );
+
+        let pak_path = dir.join("test_P.pak");
+        build_pak(&pak_path, &files).unwrap();
+        let mut file = BufReader::new(fs::File::open(&pak_path).unwrap());
+        let reader = repak::PakBuilder::new().reader(&mut file).unwrap();
+        let mut names = reader.files();
+        names.sort();
+        assert_eq!(names, paths.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(reader.mount_point(), "../../../");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
