@@ -36,7 +36,8 @@ pub struct PakIndex {
     pub mount_point: String,
     /// Compression method names; entry method `m >= 1` maps to `methods[m - 1]`.
     pub methods: Vec<String>,
-    /// Files that passed the filter, keyed by their path relative to `WwiseAudio/`.
+    /// Files that passed the filter, keyed by their path relative to `WwiseAudio/`
+    /// (or `Localization/<rest>` for `Content/Localization/` files).
     pub entries: HashMap<String, PakEntry>,
     /// Total number of files in the pak.
     pub file_count: usize,
@@ -214,7 +215,11 @@ impl PakIndex {
             let dir = fstring(&fdi, &mut c)?;
             let dir_files = u32_at(&fdi, c)?;
             c += 4;
-            let rel_dir = dir.split_once("WwiseAudio/").map(|(_, r)| r.to_string());
+            // Keys: `Media/…`, `Event/…` for WwiseAudio files; `Localization/…` for the text tables.
+            let rel_dir = dir
+                .split_once("WwiseAudio/")
+                .map(|(_, r)| r.to_string())
+                .or_else(|| dir.split_once("Content/Localization/").map(|(_, r)| format!("Localization/{r}")));
             for _ in 0..dir_files {
                 let name = fstring(&fdi, &mut c)?;
                 let entry_offset = u32_at(&fdi, c)? as i32;

@@ -1,6 +1,6 @@
 //! Human-readable twin of the binary index, in the same order, for git diffs.
 
-use crate::format::{RawIndex, EV_HAS_SHARED_MEDIA, EV_HAS_UNPAIRED, EV_LOCALISED, EV_PREFETCH_SUSPECT, NONE};
+use crate::format::{RawIndex, EV_HAS_SHARED_MEDIA, EV_HAS_UNPAIRED, EV_LOCALISED, EV_PLUGIN, EV_PREFETCH_SUSPECT, NONE};
 use std::fmt::Write;
 
 fn hex(bytes: &[u8]) -> String {
@@ -20,6 +20,9 @@ fn flag_names(flags: u8) -> String {
     }
     if flags & EV_HAS_UNPAIRED != 0 {
         v.push("unpaired");
+    }
+    if flags & EV_PLUGIN != 0 {
+        v.push("plugin");
     }
     v.join(",")
 }

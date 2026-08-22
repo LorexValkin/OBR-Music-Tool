@@ -1,6 +1,6 @@
 [package]
 name = "obr-music-tool"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Replace music and sound effects in Oblivion Remastered"
 license-file = "LICENSE"
@@ -21,6 +21,8 @@ rodio = { version = "0.20", default-features = false, features = ["mp3", "vorbis
 slint = { version = "=1.12.1", default-features = false, features = ["accessibility", "backend-winit", "compat-1-2", "renderer-femtovg", "std"] }
 walkdir = "2"
 ww2ogg = "0.1.0"
+opus-decoder = "0.1.1"
+flate2 = "1"
 oozextract = "0.5.5"
 winreg = "0.56"
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }

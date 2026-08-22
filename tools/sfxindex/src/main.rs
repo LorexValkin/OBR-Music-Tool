@@ -1,6 +1,6 @@
 //! sfxindex — builds the embedded sound index for OBR Music Tool from a game install.
 //!
-//! Usage: sfxindex <game root> [--out DIR] [--check] [--voice]
+//! Usage: sfxindex <game root> [--out DIR] [--check] [--no-voice]
 //!
 //! Reads the IoStore container (event assets) and the main pak (loose media
 //! sizes, bank sizes), pairs every event with its wem ids and source wav names,
@@ -19,6 +19,13 @@ mod oodle;
 #[allow(dead_code)]
 #[path = "../../../src/wem_info.rs"]
 mod wem_info;
+#[allow(dead_code)]
+#[path = "../../../src/voice_index/format.rs"]
+mod voice_format;
+
+mod esm;
+mod locres;
+mod voice;
 
 mod assemble;
 mod rules;
@@ -27,7 +34,7 @@ mod zen;
 
 use anyhow::{bail, Context, Result};
 use assemble::RawEvent;
-use rules::{Class, TabKind};
+use rules::Class;
 use std::collections::HashMap;
 use std::fs;
 use std::io::BufReader;
@@ -41,19 +48,28 @@ struct Args {
     voice: bool,
 }
 
+/// Deflate a blob (the voice index is stored compressed).
+fn deflate(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+    enc.write_all(bytes)?;
+    Ok(enc.finish()?)
+}
+
 fn parse_args() -> Result<Args> {
     let mut root = None;
     let mut out = PathBuf::from("assets");
     let mut check = false;
-    let mut voice = false;
+    let mut voice = true;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--out" => out = PathBuf::from(it.next().context("--out needs a directory")?),
             "--check" => check = true,
             "--voice" => voice = true,
+            "--no-voice" => voice = false,
             "-h" | "--help" => {
-                println!("usage: sfxindex <game root> [--out DIR] [--check] [--voice]");
+                println!("usage: sfxindex <game root> [--out DIR] [--check] [--no-voice]");
                 std::process::exit(0);
             }
             other if root.is_none() => root = Some(PathBuf::from(other)),
@@ -114,8 +130,8 @@ fn main() -> Result<()> {
     for (path, chunk) in &utoc.files {
         let Some(rel) = path.split_once("WwiseAudio/").map(|(_, r)| r) else { continue };
         let Some(rel) = rel.strip_suffix(".uasset") else { continue };
-        if rel.starts_with("Events/Voice/") && !args.voice {
-            continue;
+        if rel.starts_with("Events/Voice/") {
+            continue; // handled by the dialogue pass below
         }
         targets.push((rel.to_string(), *chunk));
     }
@@ -203,9 +219,14 @@ fn main() -> Result<()> {
         work.sort_by_key(|w| w.0);
         let mut file = BufReader::with_capacity(1 << 16, fs::File::open(&pak_path)?);
         let mut durations: HashMap<u32, u32> = HashMap::new();
+        let mut plugin: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut unknown = 0usize;
         for (_, id, entry) in work {
             let head = pak.read_entry_prefix(&mut file, entry, &mut dec, 512).with_context(|| format!("reading header of wem {id}"))?;
+            if wem_info::is_plugin_media(&head) {
+                plugin.insert(id);
+                continue;
+            }
             match wem_info::duration_ms(&head) {
                 Some(ms) => {
                     durations.insert(id, ms);
@@ -213,12 +234,13 @@ fn main() -> Result<()> {
                 None => unknown += 1,
             }
         }
-        println!("play lengths: {} known, {} unknown, {:.1?}", durations.len(), unknown, started.elapsed());
-        durations
+        println!("play lengths: {} known, {} unknown, {} plugin-generated, {:.1?}", durations.len(), unknown, plugin.len(), started.elapsed());
+        (durations, plugin)
     };
+    let (durations, plugin) = durations;
 
     let events = assemble::expand_music(events);
-    let (tables, stats) = assemble::build(events, utoc.fingerprint(), utoc.chunk_count() as u32, pak.index_hash, &durations);
+    let (tables, stats) = assemble::build(events, utoc.fingerprint(), utoc.chunk_count() as u32, pak.index_hash, &durations, &plugin);
     let blob = format::encode(&tables)?;
     let raw = format::RawIndex::parse(&blob)?;
     let text = tsv::render(&raw, &hidden);
@@ -244,21 +266,54 @@ fn main() -> Result<()> {
     }
     println!("binary {} bytes · tsv {} bytes · {:.1?}", blob.len(), text.len(), started.elapsed());
 
+    // Dialogue: voice files joined with the plugins' dialogue records.
+    let voice_blob = if args.voice {
+        let data_dir = paks.parent().map(|content| content.join("Dev").join("ObvData").join("Data"));
+        let data_dir = data_dir.filter(|d| d.is_dir()).context("Dev/ObvData/Data folder (plugins) not found next to Paks")?;
+        // English text table: the plugins only carry localisation keys.
+        let locres_rel = "Localization/Game/en/Game.locres";
+        let locres = {
+            let entry = pak.entries.get(locres_rel).with_context(|| format!("{locres_rel} not found in the pak (needed for dialogue names)"))?;
+            let mut f = BufReader::with_capacity(1 << 20, fs::File::open(&pak_path)?);
+            let bytes = pak.read_entry(&mut f, entry, &mut dec).with_context(|| format!("reading {locres_rel}"))?;
+            locres::Locres::parse(&bytes).with_context(|| format!("parsing {locres_rel}"))?
+        };
+        println!("localisation: {} strings in {locres_rel}", locres.len());
+        let (tables, vs) = voice::build(&utoc, &mut ucas, &mut dec, &pak, &pak_path, &data_dir, &locres, utoc.fingerprint(), &mut |m| println!("{m}"))?;
+        let raw = voice_format::encode(&tables)?;
+        let packed = deflate(&raw)?;
+        println!(
+            "dialogue: {} voice files, {} lines ({} with text, {} with a named speaker), {} with length - {} bytes raw, {} deflated - {:.1?}",
+            vs.voices, vs.lines, vs.with_text, vs.named_speaker, vs.with_length, raw.len(), packed.len(), started.elapsed()
+        );
+        Some(packed)
+    } else {
+        None
+    };
+
     let bin_path = args.out.join("sfx_index.bin");
     let tsv_path = args.out.join("sfx_index.tsv");
+    let voice_path = args.out.join("voice_index.bin");
     if args.check {
         let old_bin = fs::read(&bin_path).unwrap_or_default();
         let old_tsv = fs::read_to_string(&tsv_path).unwrap_or_default();
-        if old_bin == blob && old_tsv == text {
+        let old_voice = fs::read(&voice_path).unwrap_or_default();
+        let voice_ok = voice_blob.as_ref().map_or(true, |v| *v == old_voice);
+        if old_bin == blob && old_tsv == text && voice_ok {
             println!("check: up to date");
             return Ok(());
         }
-        bail!("check: {} differs from the game files", if old_bin == blob { "sfx_index.tsv" } else { "sfx_index.bin" });
+        bail!(
+            "check: {} differs from the game files",
+            if old_bin != blob { "sfx_index.bin" } else if old_tsv != text { "sfx_index.tsv" } else { "voice_index.bin" }
+        );
     }
     fs::create_dir_all(&args.out)?;
     fs::write(&bin_path, &blob).with_context(|| format!("writing {}", bin_path.display()))?;
     fs::write(&tsv_path, &text).with_context(|| format!("writing {}", tsv_path.display()))?;
-    println!("wrote {} and {}", bin_path.display(), tsv_path.display());
-    let _ = TabKind::ALL; // keep the enum referenced for future voice work
+    if let Some(v) = &voice_blob {
+        fs::write(&voice_path, v).with_context(|| format!("writing {}", voice_path.display()))?;
+    }
+    println!("wrote {}, {}{}", bin_path.display(), tsv_path.display(), if voice_blob.is_some() { " and voice_index.bin" } else { "" });
     Ok(())
 }

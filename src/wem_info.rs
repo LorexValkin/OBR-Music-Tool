@@ -20,6 +20,12 @@ fn u32_at(b: &[u8], o: usize) -> Option<u32> {
     b.get(o..o + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
+/// Wwise source-plugin media (SoundSeed etc.) is not sampled audio at all: the
+/// file starts with `PLUG` and holds the plugin's own parameters.
+pub fn is_plugin_media(head: &[u8]) -> bool {
+    head.len() >= 4 && &head[0..4] == b"PLUG"
+}
+
 /// Parse what fits in `head` (the start of a wem). Returns `None` when it is not
 /// a RIFF/WAVE file or the `fmt ` chunk is missing or cut off.
 pub fn parse(head: &[u8]) -> Option<WemInfo> {
@@ -45,6 +51,10 @@ pub fn parse(head: &[u8]) -> Option<WemInfo> {
                 if codec == 0xFFFF && size >= 0x42 {
                     vorb_samples = u32_at(fmt, 24).map(u64::from);
                 }
+                // Wwise Opus: fmt is 36 bytes; total samples at +0x18 (pre-skip included).
+                if codec == 0x3041 && size >= 36 {
+                    vorb_samples = u32_at(fmt, 24).map(u64::from);
+                }
                 info = Some(WemInfo { codec, channels, sample_rate, sample_count: None });
             }
             b"vorb" => {
@@ -63,7 +73,7 @@ pub fn parse(head: &[u8]) -> Option<WemInfo> {
     }
     let mut info = info?;
     info.sample_count = match info.codec {
-        0xFFFF => vorb_samples,
+        0xFFFF | 0x3041 => vorb_samples,
         0xFFFE | 0x0001 => data_size.map(|d| d / (info.channels.max(1) as u64 * 2)),
         _ => None,
     };
@@ -160,5 +170,14 @@ mod tests {
         assert_eq!(format_duration_ms(1352), "1.4 s");
         assert_eq!(format_duration_ms(115_505), "1:55");
         assert_eq!(format_duration_ms(0), "");
+        assert!(is_plugin_media(b"PLUG\xb0F\x01\x00hash"));
+        assert!(!is_plugin_media(b"RIFF"));
+
+        // Wwise Opus: 36-byte fmt, sample count at +24.
+        let mut extra = vec![0u8; 20];
+        extra[8..12].copy_from_slice(&187_246u32.to_le_bytes());
+        let opus = riff(&[(b"fmt ", fmt(0x3041, 1, 48_000, 0, &extra)), (b"data", vec![0; 8])]);
+        assert_eq!(parse(&opus).unwrap().sample_count, Some(187_246));
+        assert_eq!(duration_ms(&opus), Some(3900));
     }
 }

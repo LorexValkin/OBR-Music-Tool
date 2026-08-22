@@ -3677,12 +3677,14 @@ dependencies = [
 
 [[package]]
 name = "obr-music-tool"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "flate2",
  "mp3-duration",
  "oozextract",
+ "opus-decoder",
  "repak",
  "rfd",
  "rodio",
@@ -3744,6 +3746,15 @@ dependencies = [
  "log",
  "test-log",
  "wide",
+]
+
+[[package]]
+name = "opus-decoder"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15ae32c275dabb0cd2c863460bf349e9abc3568ba2abf0f9eb7b7d2edeeed07e"
+dependencies = [
+ "thiserror 2.0.20",
 ]
 
 [[package]]

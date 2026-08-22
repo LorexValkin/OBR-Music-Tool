@@ -21,12 +21,16 @@ mod oodle;
 mod pak;
 #[allow(dead_code)]
 mod sfx_index;
+#[allow(dead_code)]
+mod voice_index;
 mod wem;
 mod wem_decode;
 mod wem_encoder;
+#[allow(dead_code)]
 mod wem_info;
 
 use sfx_index::{SfxIndex, TabKind};
+use voice_index::VoiceIndex;
 use wem_encoder::find_wwise_cli;
 
 slint::include_modules!();
@@ -389,7 +393,10 @@ fn queued_from(replacements: &Replacements) -> Vec<QueuedWem> {
         .map(|(&wem_id, r)| QueuedWem {
             wem_id,
             event: r.via,
-            localised: index.media_by_wem(wem_id).map_or(false, |(_, w)| w.localised),
+            localised: index
+                .media_by_wem(wem_id)
+                .map(|(_, w)| w.localised)
+                .unwrap_or_else(|| VoiceIndex::get().by_wem(wem_id).is_some()),
             source: r.source.clone(),
         })
         .collect();
@@ -413,8 +420,64 @@ fn group_by_source(queued: &[QueuedWem]) -> Vec<(PathBuf, Vec<QueuedWem>)> {
     groups
 }
 
-fn event_display_name(index: &SfxIndex, event: u32) -> String {
-    index.event(event).name.to_string()
+/// Ids that name a sound in callbacks and replacements: a sound-index event
+/// index, or a dialogue voice index tagged with `VOICE_ID`.
+const VOICE_ID: u32 = 0x4000_0000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoundId {
+    Event(u32),
+    Voice(u32),
+}
+
+fn parse_id(id: u32) -> SoundId {
+    if id & VOICE_ID != 0 {
+        SoundId::Voice(id & !VOICE_ID)
+    } else {
+        SoundId::Event(id)
+    }
+}
+
+/// Validate an id coming from the UI.
+fn sound_id(raw: i32) -> Option<SoundId> {
+    if raw < 0 {
+        return None;
+    }
+    match parse_id(raw as u32) {
+        SoundId::Event(e) if (e as usize) < SfxIndex::get().events().len() => Some(SoundId::Event(e)),
+        SoundId::Voice(v) if (v as usize) < VoiceIndex::get().len() => Some(SoundId::Voice(v)),
+        _ => None,
+    }
+}
+
+/// `Speaker: topic` for a dialogue line.
+fn voice_display_name(voice: u32) -> String {
+    let vi = VoiceIndex::get();
+    let line = vi.line_of(vi.voice(voice));
+    format!("{}: {}", vi.speaker_label(voice), if line.topic.is_empty() { "dialogue" } else { line.topic })
+}
+
+fn event_display_name(index: &SfxIndex, id: u32) -> String {
+    match parse_id(id) {
+        SoundId::Event(e) => index.event(e).name.to_string(),
+        SoundId::Voice(v) => voice_display_name(v),
+    }
+}
+
+/// Tab index of any sound id.
+fn tab_of_id(index: &SfxIndex, id: u32) -> usize {
+    match parse_id(id) {
+        SoundId::Event(e) => index.event(e).tab as usize,
+        SoundId::Voice(_) => index.tab_index(TabKind::Dialogue).unwrap_or(0),
+    }
+}
+
+/// Group (sub-heading) of any sound id.
+fn group_of_id(index: &SfxIndex, id: u32) -> String {
+    match parse_id(id) {
+        SoundId::Event(e) => index.group(index.event(e)).name.to_string(),
+        SoundId::Voice(v) => VoiceIndex::get().speaker_label(v),
+    }
 }
 
 /// README lines for every queued event whose wems all staged successfully,
@@ -429,10 +492,9 @@ fn replaced_lines(queued: &[QueuedWem], staged_ok: &HashSet<u32>) -> Vec<Replace
         .into_iter()
         .filter(|(_, items)| items.iter().all(|q| staged_ok.contains(&q.wem_id)))
         .map(|(event, items)| {
-            let ev = index.event(event);
             ReplacedLine {
-                tab: index.tabs()[ev.tab as usize].name.to_string(),
-                group: index.group(ev).name.to_string(),
+                tab: index.tabs()[tab_of_id(index, event)].name.to_string(),
+                group: group_of_id(index, event),
                 name: event_display_name(index, event),
                 variations: items.len(),
                 source: items[0].source.file_name().unwrap_or_default().to_string_lossy().to_string(),
@@ -563,12 +625,11 @@ fn playlist_text(replacements: &Replacements) -> String {
         by_event.entry(r.via).or_default().push((wem_id, r.source.as_path()));
     }
     for (event, wems) in by_event {
-        let ev = index.event(event);
         lines.push(String::new());
         lines.push(format!(
             "# {} / {} / {}",
-            index.tabs()[ev.tab as usize].name,
-            index.group(ev).name,
+            index.tabs()[tab_of_id(index, event)].name,
+            group_of_id(index, event),
             event_display_name(index, event)
         ));
         for (wem_id, source) in wems {
@@ -859,18 +920,22 @@ fn find_main_pak(game_root: &Path) -> Option<PathBuf> {
 fn load_preview_pak(game_root: &Path) -> Result<PreviewPak> {
     let path = find_main_pak(game_root).context("no main .pak found in the game's Paks folder")?;
     let index = pak::PakIndex::read(&path, |rel| {
-        rel.strip_prefix("Media/").map_or(false, |r| r.ends_with(".wem") && !r.contains('/'))
+        rel.strip_prefix("Media/").map_or(false, |r| {
+            let r = r.strip_prefix("English(US)/").unwrap_or(r);
+            r.ends_with(".wem") && !r.contains('/')
+        })
     })
     .with_context(|| format!("reading {}", path.display()))?;
     Ok(PreviewPak { path, index })
 }
 
 impl PreviewPak {
-    fn extract(&self, wem_id: u32) -> Result<Vec<u8>> {
+    fn extract(&self, wem_id: u32, localised: bool) -> Result<Vec<u8>> {
+        let rel = if localised { format!("Media/English(US)/{}.wem", wem_id) } else { format!("Media/{}.wem", wem_id) };
         let entry = self
             .index
             .entries
-            .get(&format!("Media/{}.wem", wem_id))
+            .get(&rel)
             .with_context(|| format!("wem {} is not in {}", wem_id, self.path.display()))?;
         let mut file = BufReader::new(fs::File::open(&self.path).with_context(|| format!("opening {}", self.path.display()))?);
         self.index.read_entry(&mut file, entry, &mut oodle::Oodle::new())
@@ -988,7 +1053,9 @@ fn entry_for_event(index: &SfxIndex, st: &AppState, event: u32, expanded: bool) 
         }
     }
 
-    let status = if replaced == 0 {
+    let status = if ev.plugin() {
+        "plugin"
+    } else if replaced == 0 {
         "vanilla"
     } else if replaced == total {
         "replace"
@@ -1019,7 +1086,7 @@ fn entry_for_event(index: &SfxIndex, st: &AppState, event: u32, expanded: bool) 
     } else {
         let detail = first_wem.and_then(|w| w.wav).unwrap_or("").to_string();
         // Sound effects are previewed from the game's pak, so a connected game is enough.
-        (index.group(ev).name.to_string(), ev.name.to_string(), String::new(), detail, st.game_root.is_some())
+        (index.group(ev).name.to_string(), ev.name.to_string(), String::new(), detail, st.game_root.is_some() && !ev.plugin())
     };
 
     let length = length_label(min_ms, max_ms);
@@ -1056,12 +1123,46 @@ fn length_label(min_ms: u32, max_ms: u32) -> String {
     }
 }
 
+/// Builds the row for a dialogue voice file.
+fn entry_for_voice(st: &AppState, voice: u32) -> TrackEntry {
+    let vi = VoiceIndex::get();
+    let v = vi.voice(voice);
+    let line = vi.line_of(v);
+    let replacement = st.replacements.get(&v.wem_id);
+    let replacement_label = replacement
+        .map(|r| r.source.file_name().unwrap_or_default().to_string_lossy().to_string())
+        .unwrap_or_default();
+    let text = if line.text.is_empty() {
+        format!("({})", if line.topic.is_empty() { "no subtitle" } else { line.topic })
+    } else {
+        line.text.to_string()
+    };
+    let detail = if line.topic.is_empty() { v.voice_type() } else { format!("{} \u{00b7} {}", line.topic, v.voice_type()) };
+    TrackEntry {
+        event: (VOICE_ID | voice) as i32,
+        kind: 0,
+        variation: 0,
+        expanded: false,
+        length: wem_info::format_duration_ms(v.duration_ms).into(),
+        group: vi.speaker_label(voice).into(),
+        name: text.into(),
+        detail: detail.into(),
+        size: String::new().into(),
+        status: if replacement.is_some() { "replace" } else { "vanilla" }.into(),
+        replacement: replacement_label.into(),
+        variations: 1,
+        shared: 0,
+        warning: false,
+        can_play: st.game_root.is_some() || replacement.is_some(),
+    }
+}
+
 /// Builds the row for one variation (wem) of an expanded event.
 fn entry_for_variation(index: &SfxIndex, st: &AppState, event: u32, variation: usize) -> TrackEntry {
     let ev = index.event(event);
     let (wi, wem): (u32, &Wem) = index.media_of(ev).nth(variation).unwrap_or_else(|| index.media_of(ev).next().expect("event without media"));
     let replacement = st.replacements.get(&wem.id);
-    let status = if replacement.is_some() { "replace" } else { "vanilla" };
+    let status = if wem.plugin { "plugin" } else if replacement.is_some() { "replace" } else { "vanilla" };
     let replacement_label = replacement
         .map(|r| {
             let file = r.source.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -1083,7 +1184,7 @@ fn entry_for_variation(index: &SfxIndex, st: &AppState, event: u32, variation: u
         variations: 1,
         shared: index.events_sharing(wi).len().saturating_sub(1) as i32,
         warning: false,
-        can_play: st.game_root.is_some() || replacement.is_some(),
+        can_play: !wem.plugin && (st.game_root.is_some() || replacement.is_some()),
     }
 }
 
@@ -1149,7 +1250,11 @@ impl InventoryModel {
     fn set_view(&self, tab: usize, query: &str) {
         let index = SfxIndex::get();
         let tab = tab.min(index.tabs().len().saturating_sub(1));
-        let mut filtered = index.search(tab, query);
+        let mut filtered = if index.tabs()[tab].kind == TabKind::Dialogue {
+            VoiceIndex::get().search(query).into_iter().map(|v| VOICE_ID | v).collect()
+        } else {
+            index.search(tab, query)
+        };
         if index.tabs()[tab].kind == TabKind::Music {
             filtered.sort_by_key(|&e| {
                 index.media_of(index.event(e)).next().map(|(_, w)| music_position(w.id)).unwrap_or(usize::MAX)
@@ -1218,9 +1323,11 @@ impl InventoryModel {
         let mut rows = Vec::with_capacity(end - start + 8);
         for &ev in &filtered[start..end] {
             rows.push(ev);
-            if expanded.contains(&ev) {
-                for i in 0..index.event(ev).media_count() {
-                    rows.push(variation_row(ev, i));
+            if let SoundId::Event(e) = parse_id(ev) {
+                if expanded.contains(&ev) {
+                    for i in 0..index.event(e).media_count() {
+                        rows.push(variation_row(e, i));
+                    }
                 }
             }
         }
@@ -1258,7 +1365,10 @@ impl Model for InventoryModel {
         let index = SfxIndex::get();
         let st = state(&self.shared);
         Some(match row_ref(row) {
-            RowRef::Event(ev) => entry_for_event(index, &st, ev, self.is_expanded(ev)),
+            RowRef::Event(ev) => match parse_id(ev) {
+                SoundId::Event(e) => entry_for_event(index, &st, e, self.is_expanded(ev)),
+                SoundId::Voice(v) => entry_for_voice(&st, v),
+            },
             RowRef::Variation { event, index: i } => entry_for_variation(index, &st, event, i),
         })
     }
@@ -1297,7 +1407,7 @@ fn update_counts(app: &AppWindow, shared: &SharedState, tabs: &slint::VecModel<T
     let events: HashSet<u32> = state(shared).replacements.values().map(|r| r.via).collect();
     let mut per_tab = vec![0usize; index.tabs().len()];
     for ev in &events {
-        per_tab[index.event(*ev).tab as usize] += 1;
+        per_tab[tab_of_id(index, *ev)] += 1;
     }
     app.set_staged_count(events.len() as i32);
     for (i, tab) in index.tabs().iter().enumerate() {
@@ -1310,7 +1420,8 @@ fn update_counts(app: &AppWindow, shared: &SharedState, tabs: &slint::VecModel<T
 
 /// Events affected by a change to `event`: itself plus every event sharing one of its wems.
 fn affected_events(index: &SfxIndex, event: u32) -> Vec<u32> {
-    let ev = index.event(event);
+    let SoundId::Event(e) = parse_id(event) else { return vec![event] };
+    let ev = index.event(e);
     let mut out = vec![event];
     for (wi, _) in index.media_of(ev) {
         out.extend_from_slice(index.events_sharing(wi));
@@ -1377,23 +1488,31 @@ fn try_connect_game(app: &AppWindow, shared: &SharedState, path: &str, model: &I
 /// Build the preview for `event` (`variation` is 1-based, or -1 for the sound's
 /// first audio file): the queued replacement if there is one, the loose mp3 for
 /// music, otherwise the original audio extracted from the game's pak.
-fn load_preview(shared: &SharedState, event: u32, variation: i32) -> Result<Preview> {
+fn load_preview(shared: &SharedState, id: u32, variation: i32) -> Result<Preview> {
     let index = SfxIndex::get();
-    let ev = index.event(event);
-    let which = if variation >= 1 { variation as usize - 1 } else { 0 };
-    let (_, wem) = index.media_of(ev).nth(which).context("no such variation")?;
-    let name = event_display_name(index, event);
-    let label = if ev.media_count() > 1 { format!("{} (variation {})", name, which + 1) } else { name };
+    let (wem_id, localised, label) = match parse_id(id) {
+        SoundId::Event(event) => {
+            let ev = index.event(event);
+            let which = if variation >= 1 { variation as usize - 1 } else { 0 };
+            let (_, wem) = index.media_of(ev).nth(which).context("no such variation")?;
+            let name = event_display_name(index, id);
+            (wem.id, wem.localised, if ev.media_count() > 1 { format!("{} (variation {})", name, which + 1) } else { name })
+        }
+        SoundId::Voice(v) => {
+            let voice = VoiceIndex::get().voice(v);
+            (voice.wem_id, true, voice_display_name(v))
+        }
+    };
 
     let mut st = state(shared);
-    if let Some(r) = st.replacements.get(&wem.id) {
+    if let Some(r) = st.replacements.get(&wem_id) {
         let source = r.source.clone();
         drop(st);
         let mut p = preview_from_file(&source)?;
         p.label = format!("{} <- {}", label, p.label);
         return Ok(p);
     }
-    if let Some((path, _)) = st.music_files.get(&wem.id) {
+    if let Some((path, _)) = st.music_files.get(&wem_id) {
         let path = path.clone();
         drop(st);
         return preview_from_file(&path);
@@ -1404,14 +1523,14 @@ fn load_preview(shared: &SharedState, event: u32, variation: i32) -> Result<Prev
     if st.preview_pak.is_none() {
         st.preview_pak = Some(load_preview_pak(&root)?);
     }
-    let bytes = st.preview_pak.as_ref().unwrap().extract(wem.id)?;
+    let bytes = st.preview_pak.as_ref().unwrap().extract(wem_id, localised)?;
     drop(st);
     preview_from_wem_bytes(&bytes, label)
 }
 
 fn play_sound(app: &AppWindow, shared: &SharedState, timer: &Rc<Timer>, event: i32, variation: i32) {
     let index = SfxIndex::get();
-    if event < 0 || event as usize >= index.events().len() {
+    if sound_id(event).is_none() {
         return;
     }
     state(shared).audio = None;
@@ -1478,6 +1597,24 @@ fn play_sound(app: &AppWindow, shared: &SharedState, timer: &Rc<Timer>, event: i
     });
 }
 
+/// Replace one dialogue voice file (Dialogue tab rows).
+fn replace_voice(app: &AppWindow, shared: &SharedState, model: &InventoryModel, tabs: &slint::VecModel<TabInfo>, voice: u32) {
+    let vi = VoiceIndex::get();
+    let v = vi.voice(voice);
+    let name = voice_display_name(voice);
+    let id = VOICE_ID | voice;
+    let dialog = rfd::FileDialog::new()
+        .set_title(format!("Replace {} ({})", name, v.voice_type()))
+        .add_filter("Audio Files", &["mp3", "wav", "ogg", "flac", "wem"]);
+    let Some(source) = dialog.pick_file() else { return };
+    let fname = source.file_name().unwrap_or_default().to_string_lossy().to_string();
+    state(shared).replacements.insert(v.wem_id, Replacement { source, via: id });
+    model.invalidate_events(&[id]);
+    update_counts(app, shared, tabs);
+    append_log(app, &format!("Queued: {} <- {}", name, fname));
+    set_status(app, "Ready", &format!("{} queued for replacement.", name), Tone::Success);
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -1522,7 +1659,7 @@ fn main() -> Result<(), slint::PlatformError> {
     sync_page_props(&app, &model);
     append_log(
         &app,
-        &format!("Sound index: {} sounds in {} tabs.", index.events().len(), index.tabs().iter().filter(|t| t.kind.available()).count()),
+        &format!("Sound index: {} sounds in {} tabs, {} dialogue lines.", index.events().len(), index.tabs().iter().filter(|t| t.kind.available()).count(), VoiceIndex::get().len()),
     );
 
     if let Some(root) = find_game_install() {
@@ -1605,13 +1742,21 @@ fn main() -> Result<(), slint::PlatformError> {
         app.on_replace_track(move |event| {
             let Some(app) = weak.upgrade() else { return };
             let index = SfxIndex::get();
-            if event < 0 || event as usize >= index.events().len() {
-                return;
-            }
-            let event = event as u32;
+            let event = match sound_id(event) {
+                Some(SoundId::Event(e)) => e,
+                Some(SoundId::Voice(v)) => {
+                    replace_voice(&app, &shared, &model, &tabs, v);
+                    return;
+                }
+                None => return,
+            };
             let ev = index.event(event);
             let name = event_display_name(index, event);
             let tab_name = index.tabs()[ev.tab as usize].name;
+            if ev.plugin() {
+                set_status(&app, "Cannot replace", &format!("{} is generated by a Wwise plugin; it has no audio file to swap.", name), Tone::Warning);
+                return;
+            }
 
             let dialog = rfd::FileDialog::new()
                 .set_title(format!("Replace {} ({})", name, tab_name))
@@ -1675,10 +1820,20 @@ fn main() -> Result<(), slint::PlatformError> {
         app.on_remove_staged(move |event| {
             let Some(app) = weak.upgrade() else { return };
             let index = SfxIndex::get();
-            if event < 0 || event as usize >= index.events().len() {
-                return;
-            }
-            let event = event as u32;
+            let event = match sound_id(event) {
+                Some(SoundId::Event(e)) => e,
+                Some(SoundId::Voice(v)) => {
+                    let voice = VoiceIndex::get().voice(v);
+                    let name = voice_display_name(v);
+                    state(&shared).replacements.remove(&voice.wem_id);
+                    model.invalidate_events(&[VOICE_ID | v]);
+                    update_counts(&app, &shared, &tabs);
+                    append_log(&app, &format!("Removed: {}", name));
+                    set_status(&app, "Ready", &format!("{} replacement cleared.", name), Tone::Neutral);
+                    return;
+                }
+                None => return,
+            };
             let ev = index.event(event);
             let name = event_display_name(index, event);
 
@@ -1729,7 +1884,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let model = model.clone();
         app.on_toggle_expand(move |event| {
-            if event < 0 || (event as usize) >= SfxIndex::get().events().len() {
+            if !matches!(sound_id(event), Some(SoundId::Event(_))) {
                 return;
             }
             // Defer past the current click sequence so the rows that appear never land
@@ -1754,6 +1909,10 @@ fn main() -> Result<(), slint::PlatformError> {
             let ev = index.event(event);
             let Some((wi, wem)) = index.media_of(ev).nth(variation as usize - 1) else { return };
             let name = event_display_name(index, event);
+            if wem.plugin {
+                set_status(&app, "Cannot replace", &format!("{} variation {} is generated by a Wwise plugin; it has no audio file to swap.", name, variation), Tone::Warning);
+                return;
+            }
             let wav = wem.wav.unwrap_or("");
             let dialog = rfd::FileDialog::new()
                 .set_title(format!("Replace {} - variation {} ({})", name, variation, if wav.is_empty() { "no source name" } else { wav }))
@@ -2116,13 +2275,21 @@ fn main() -> Result<(), slint::PlatformError> {
                 let mut st = state(&shared);
                 st.replacements.clear();
                 for (id, source) in entries {
-                    let Some((wi, _)) = index.media_by_wem(id) else {
-                        skipped.push(format!("unknown sound id {}", id));
-                        continue;
-                    };
-                    let Some(via) = index.primary_event_of_wem(wi) else {
-                        skipped.push(format!("sound id {} is not used by any event", id));
-                        continue;
+                    let via = match index.media_by_wem(id) {
+                        Some((wi, _)) => match index.primary_event_of_wem(wi) {
+                            Some(via) => via,
+                            None => {
+                                skipped.push(format!("sound id {} is not used by any event", id));
+                                continue;
+                            }
+                        },
+                        None => match VoiceIndex::get().by_wem(id) {
+                            Some(v) => VOICE_ID | v,
+                            None => {
+                                skipped.push(format!("unknown sound id {}", id));
+                                continue;
+                            }
+                        },
                     };
                     if !source.is_file() {
                         skipped.push(format!(
@@ -2406,6 +2573,39 @@ mod tests {
         assert_eq!(entry_for_variation(index, &st, multi, 1).status.as_str(), "replace");
         assert_eq!(entry_for_variation(index, &st, multi, 0).status.as_str(), "vanilla");
         assert_eq!(entry_for_event(index, &st, multi, false).status.as_str(), "partial");
+    }
+
+    #[test]
+    fn dialogue_rows_replace_and_round_trip() {
+        let index = SfxIndex::get();
+        let vi = VoiceIndex::get();
+        let shared: SharedState = Arc::new(Mutex::new(AppState { game_root: None, music_files: HashMap::new(), preview_pak: None, replacements: Replacements::new(), audio: None }));
+        let model = InventoryModel::new(shared.clone());
+        let dialogue = index.tab_index(TabKind::Dialogue).unwrap();
+        model.set_view(dialogue, "sheogorath");
+        assert!(model.filtered_len() > 0);
+        let row = model.row_data(0).unwrap();
+        assert_eq!(row.kind, 0);
+        let id = row.event as u32;
+        let SoundId::Voice(v) = parse_id(id) else { panic!("not a voice id") };
+        assert_eq!(sound_id(row.event), Some(SoundId::Voice(v)));
+        assert!(!row.group.is_empty() && !row.name.is_empty());
+
+        // Replacing a voice file is keyed by its (localised) wem.
+        let wem = vi.voice(v).wem_id;
+        state(&shared).replacements.insert(wem, Replacement { source: PathBuf::from(r"C:\voice\line.wav"), via: id });
+        assert_eq!(model.row_data(0).unwrap().status.as_str(), "replace");
+        let queued = queued_from(&state(&shared).replacements);
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].localised);
+        let lines = replaced_lines(&queued, &[wem].into_iter().collect());
+        assert_eq!(lines[0].tab, "Dialogue");
+        assert_eq!(lines[0].name, voice_display_name(v));
+        let text = playlist_text(&state(&shared).replacements);
+        assert!(text.contains("# Dialogue / "), "{text}");
+        assert_eq!(parse_playlist(&text).unwrap(), vec![(wem, PathBuf::from(r"C:\voice\line.wav"))]);
+        assert_eq!(tab_of_id(index, id), dialogue);
+        assert_eq!(affected_events(index, id), vec![id]);
     }
 
     #[test]

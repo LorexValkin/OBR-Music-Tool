@@ -1,9 +1,10 @@
 //! Turns classified events into the sorted, interned tables of the binary format.
 
 use crate::format::{
-    EventRec, GroupRec, TabRec, Tables, WemRec, EV_HAS_SHARED_MEDIA, EV_HAS_UNPAIRED, EV_LOCALISED,
-    EV_PREFETCH_SUSPECT, NONE, WEM_LOCALISED, WEM_SHARED,
+    EventRec, GroupRec, TabRec, Tables, WemRec, EV_HAS_SHARED_MEDIA, EV_HAS_UNPAIRED, EV_LOCALISED, EV_PLUGIN,
+    EV_PREFETCH_SUSPECT, NONE, WEM_LOCALISED, WEM_PLUGIN, WEM_SHARED,
 };
+use std::collections::HashSet;
 use crate::rules::{self, TabKind};
 use crate::zen::MediaRef;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -90,7 +91,7 @@ pub fn natural_key(s: &str) -> String {
     out
 }
 
-pub fn build(mut events: Vec<RawEvent>, utoc_fingerprint: u64, utoc_entry_count: u32, pak_index_hash: [u8; 20], durations: &HashMap<u32, u32>) -> (Tables, Stats) {
+pub fn build(mut events: Vec<RawEvent>, utoc_fingerprint: u64, utoc_entry_count: u32, pak_index_hash: [u8; 20], durations: &HashMap<u32, u32>, plugin: &HashSet<u32>) -> (Tables, Stats) {
     events.sort_by_cached_key(sort_key);
 
     // Wem table: id -> (wav, localised, events)
@@ -159,6 +160,9 @@ pub fn build(mut events: Vec<RawEvent>, utoc_fingerprint: u64, utoc_entry_count:
                 media.dedup_by_key(|m| m.id);
                 let first_media = media_refs.len() as u32;
                 let mut flags = 0u8;
+                if !media.is_empty() && media.iter().all(|m| plugin.contains(&m.id)) {
+                    flags |= EV_PLUGIN;
+                }
                 for m in &media {
                     let wi = wem_index[&m.id];
                     media_refs.push(wi);
@@ -223,6 +227,9 @@ pub fn build(mut events: Vec<RawEvent>, utoc_fingerprint: u64, utoc_entry_count:
             flags |= WEM_SHARED;
             stats.shared_wems += 1;
         }
+        if plugin.contains(&id) {
+            flags |= WEM_PLUGIN;
+        }
         if wav.is_some() {
             stats.paired += 1;
         }
@@ -285,8 +292,9 @@ mod tests {
         let mut shuffled = events.clone();
         shuffled.reverse();
         let durations: HashMap<u32, u32> = [(100, 2037), (300, 1000)].into_iter().collect();
-        let (a, stats) = build(events, 1, 2, [3; 20], &durations);
-        let (b, _) = build(shuffled, 1, 2, [3; 20], &durations);
+        let plugin: HashSet<u32> = [400].into_iter().collect();
+        let (a, stats) = build(events, 1, 2, [3; 20], &durations, &plugin);
+        let (b, _) = build(shuffled, 1, 2, [3; 20], &durations, &plugin);
         assert_eq!(a, b);
         let blob = encode(&a).unwrap();
         let raw = RawIndex::parse(&blob).unwrap();
@@ -307,6 +315,10 @@ mod tests {
         let w100 = (0..raw.header.wem_count as usize).map(|i| raw.wem(i)).find(|w| w.id == 100).unwrap();
         assert_eq!(w100.duration_ms, 2037);
         assert_eq!(w.duration_ms, 0);
+        let w400 = (0..raw.header.wem_count as usize).map(|i| raw.wem(i)).find(|w| w.id == 400).unwrap();
+        assert_eq!(w400.flags & WEM_PLUGIN, WEM_PLUGIN);
+        let chimes = (0..raw.header.event_count as usize).map(|i| raw.event(i)).find(|e| raw.string(e.name) == "emt_chimes").unwrap();
+        assert_eq!(chimes.flags & EV_PLUGIN, EV_PLUGIN);
     }
 
     #[test]

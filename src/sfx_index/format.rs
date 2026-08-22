@@ -40,10 +40,14 @@ pub const EV_PREFETCH_SUSPECT: u8 = 1;
 pub const EV_HAS_SHARED_MEDIA: u8 = 2;
 pub const EV_LOCALISED: u8 = 4;
 pub const EV_HAS_UNPAIRED: u8 = 8;
+/// Every media of the event is plugin-generated (no replaceable audio file).
+pub const EV_PLUGIN: u8 = 16;
 
 /// Wem flags.
 pub const WEM_LOCALISED: u16 = 1;
 pub const WEM_SHARED: u16 = 2;
+/// Wwise source-plugin media (`PLUG` file), not sampled audio.
+pub const WEM_PLUGIN: u16 = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Header {
