@@ -49,7 +49,7 @@ Before converting audio you will need Wwise Authoring installed once; see [Insta
 | Requirement | Notes |
 |---|---|
 | **Windows 10 / 11 (64-bit)** | The tool, and Wwise Authoring, are Windows-only. |
-| **Oblivion Remastered** | Steam and Xbox / Game Pass installs are auto-detected. |
+| **Oblivion Remastered** (Steam) | The Steam install is auto-detected; you can also point the tool at the folder by hand. Xbox app / Game Pass installs are not supported. |
 | **Wwise Authoring** (free) | Needed to convert audio into `.wem`. About 2 GB. See [Installing Wwise](#installing-wwise) below. *Not* needed if you only feed the tool pre-encoded `.wem` files. |
 
 No admin rights are required and the tool never connects to the internet.
@@ -178,6 +178,11 @@ events).
 | Public | Town 01-05 | `town_01.mp3` … `town_05.mp3` |
 | Special | Title Screen, Death, Success | `tes4title.mp3`, `death.mp3`, `success.mp3` |
 
+> **Title Screen music loops on a fixed timing.** The game's title music is set up in Wwise to loop seamlessly at a
+> specific point in the track. A replacement of a different length will not line up with that loop point, so it may
+> loop with a gap, restart mid-phrase or cut off. If you replace it, trim your file so it loops cleanly on its own, or
+> expect the seam to be audible.
+
 ## Troubleshooting
 
 | Symptom | What to check |
@@ -185,7 +190,8 @@ events).
 | *Wwise not found* | Click **Browse** and select the Wwise **version** folder (the one containing `Authoring`). Or set the `WWISEROOT` environment variable to it. |
 | *WwiseConsole conversion failed* | Make sure the **Windows** deployment platform was included in the Wwise install. Try re-saving the source as `.wav`; confirm the file plays in a normal media player. |
 | Build succeeds but the music is unchanged in-game | Confirm the pak is in `OblivionRemastered\Content\Paks` (or `Paks\~mods`) and its name ends with `_P.pak`. Remove other music mods that replace the same tracks. |
-| Game not detected | Click **Find game** and pick the install folder, the one that contains `OblivionRemastered` and `Engine`. You can also set `OBLIVION_REMASTERED_ROOT`. |
+| Game not detected | Click **Find game** and pick the install folder, the one that contains `OblivionRemastered` and `Engine`. You can also set `OBLIVION_REMASTERED_ROOT`. Xbox app / Game Pass installs are not supported. |
+| Title screen music loops with a gap or cuts off | The title track loops at a fixed point set inside the game; see the note under the track list. Trim the replacement so it loops on its own. |
 | A music track has no Play button / the log says it cannot be played | That track has no loose `.mp3` in your install, so it cannot be previewed. Replacing it still works. |
 | Play on a sound effect says it cannot be previewed | Connect the game folder first; previews are read from the game's pak. A handful of sounds use codecs the app cannot decode yet (Wwise ADPCM / Opus); replacing them still works. |
 | Replacing one sound changed others too | Those sounds share the same audio file inside the game (the app notes this when you replace them). Removing the replacement on any of them clears it for all. |
@@ -214,7 +220,7 @@ so building the app never needs the game. After a game update, rebuild them with
 cargo run --release --manifest-path tools/sfxindex/Cargo.toml -- "D:\SteamLibrary\steamapps\common\Oblivion Remastered" --out assets
 ```
 
-Any install root works (Steam or Game Pass, any drive); the tool finds the `Paks` folder itself. Add `--check` to
+Any install root works (any drive); the tool finds the `Paks` folder itself. Add `--check` to
 verify the committed files are still up to date without writing. `cargo test --manifest-path tools/sfxindex/Cargo.toml`
 runs the builder's own tests, including a golden test over the committed `.tsv`. Both the app (sound preview) and
 the builder decompress Oodle with the pure-Rust [oozextract](https://crates.io/crates/oozextract); the app only ever
