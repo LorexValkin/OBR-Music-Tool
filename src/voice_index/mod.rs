@@ -9,7 +9,7 @@
 pub mod format;
 
 use format::{RawVoiceIndex, LINE_NAMED_SPEAKER, NONE, VOICE_ALT};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::sync::OnceLock;
 
@@ -57,36 +57,54 @@ impl Voice {
     }
 }
 
-/// How a speaker group was derived.
+/// How a speaker group was derived. The order is the display order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SpeakerKind {
+    /// Root of the generic tree: lines any NPC of a race can say
+    /// (Generics -> race -> sex -> lines).
+    Generic,
     /// A named NPC from the line's conditions.
     Npc,
     /// Lines for members of a faction.
     Faction,
     /// Lines for NPCs of a class.
     Class,
-    /// Lines any NPC of a race and sex can say.
+    /// One race under the generic root (children: its sexes).
     Race,
+    /// One race + sex under a race (holds the generic lines).
+    RaceSex,
 }
 
 impl SpeakerKind {
     pub fn label(self) -> &'static str {
         match self {
+            SpeakerKind::Generic => "Generic",
             SpeakerKind::Npc => "NPC",
             SpeakerKind::Faction => "Faction",
             SpeakerKind::Class => "Class",
             SpeakerKind::Race => "Race",
+            SpeakerKind::RaceSex => "Sex",
         }
     }
 }
 
-/// A speaker group of the Dialogue tab: every voice line said by one NPC
-/// (or by a faction, class, or race+sex), in display order.
+/// A speaker group of the Dialogue tab: every voice line said by one NPC (or by
+/// a faction or class), or a node of the generic tree. `voices` of a node with
+/// `children` is the union of its descendants, in display order.
 pub struct Speaker {
     pub label: &'static str,
     pub kind: SpeakerKind,
     pub voices: Vec<u32>,
+    pub parent: Option<u32>,
+    pub children: Vec<u32>,
+}
+
+/// Result of [`VoiceIndex::search_speakers`].
+pub struct SpeakerHits {
+    /// Top-level speakers with their matching voices, in display order.
+    pub top: Vec<(u32, Vec<u32>)>,
+    /// Matching voices of every nested speaker (race / sex nodes) that has any.
+    pub nested: HashMap<u32, Vec<u32>>,
 }
 
 pub struct VoiceIndex {
@@ -155,13 +173,17 @@ impl VoiceIndex {
         let by_wem = (0..h.voice_count as usize).map(|i| raw.by_wem(i)).collect();
         let haystack = lines
             .iter()
-            .map(|l| format!("{}|{}|{}|{}|{}", l.speaker, l.topic, l.quest, l.text, l.plugin).to_lowercase())
+            .map(|l| {
+                let speaker = if l.speaker.is_empty() { "generic" } else { l.speaker };
+                format!("{}|{}|{}|{}|{}", speaker, l.topic, l.quest, l.text, l.plugin).to_lowercase()
+            })
             .collect();
         let races_lc: Vec<String> = races.iter().map(|r| r.to_lowercase()).collect();
 
         // Speaker groups: one per NPC named in the line's conditions, else the
-        // faction/class hint, else "Any <race> <sex>".
-        let mut race_labels: HashMap<(&'static str, bool), &'static str> = HashMap::new();
+        // faction/class hint, else a race+sex leaf of the generic tree
+        // (Generics -> race -> sex -> lines).
+        let mut leaf_labels: BTreeMap<(&'static str, bool), &'static str> = BTreeMap::new();
         let mut groups: HashMap<(SpeakerKind, &'static str), Vec<u32>> = HashMap::new();
         let mut per_voice: Vec<Vec<(SpeakerKind, &'static str)>> = Vec::with_capacity(voices.len());
         for (i, v) in voices.iter().enumerate() {
@@ -174,19 +196,51 @@ impl VoiceIndex {
             } else if !l.speaker.is_empty() {
                 labels.push((SpeakerKind::Class, l.speaker));
             } else {
-                let label = *race_labels
+                let label = *leaf_labels
                     .entry((v.race, v.female))
-                    .or_insert_with(|| Box::leak(format!("Any {} {}", v.race, if v.female { "female" } else { "male" }).into_boxed_str()));
-                labels.push((SpeakerKind::Race, label));
+                    .or_insert_with(|| Box::leak(format!("{} {}", v.race, if v.female { "female" } else { "male" }).into_boxed_str()));
+                labels.push((SpeakerKind::RaceSex, label));
             }
             for lab in &labels {
                 groups.entry(*lab).or_default().push(i as u32);
             }
             per_voice.push(labels);
         }
-        let mut speakers: Vec<Speaker> = groups.into_iter().map(|((kind, label), voices)| Speaker { label, kind, voices }).collect();
+        // Race nodes and the generic root carry the union of their leaves.
+        let mut race_children: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
+        for (&(race, _), &label) in &leaf_labels {
+            race_children.entry(race).or_default().push(label);
+        }
+        let mut all_generic: Vec<u32> = Vec::new();
+        for (&race, leaves) in &race_children {
+            let mut union: Vec<u32> = leaves.iter().flat_map(|l| groups[&(SpeakerKind::RaceSex, *l)].iter().copied()).collect();
+            union.sort_unstable();
+            all_generic.extend_from_slice(&union);
+            groups.insert((SpeakerKind::Race, race), union);
+        }
+        all_generic.sort_unstable();
+        const GENERIC_LABEL: &str = "Generic lines";
+        if !all_generic.is_empty() {
+            groups.insert((SpeakerKind::Generic, GENERIC_LABEL), all_generic);
+        }
+        let mut speakers: Vec<Speaker> = groups
+            .into_iter()
+            .map(|((kind, label), voices)| Speaker { label, kind, voices, parent: None, children: Vec::new() })
+            .collect();
         speakers.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase())).then_with(|| a.label.cmp(b.label)));
         let speaker_ids: HashMap<(SpeakerKind, &'static str), u32> = speakers.iter().enumerate().map(|(i, sp)| ((sp.kind, sp.label), i as u32)).collect();
+        if let Some(&root) = speaker_ids.get(&(SpeakerKind::Generic, GENERIC_LABEL)) {
+            for (&race, leaves) in &race_children {
+                let race_id = speaker_ids[&(SpeakerKind::Race, race)];
+                speakers[race_id as usize].parent = Some(root);
+                speakers[root as usize].children.push(race_id);
+                for leaf in leaves {
+                    let leaf_id = speaker_ids[&(SpeakerKind::RaceSex, *leaf)];
+                    speakers[leaf_id as usize].parent = Some(race_id);
+                    speakers[race_id as usize].children.push(leaf_id);
+                }
+            }
+        }
         let mut voice_speaker_offsets = Vec::with_capacity(voices.len() + 1);
         let mut voice_speaker_ids = Vec::with_capacity(voices.len());
         for labels in &per_voice {
@@ -238,37 +292,66 @@ impl VoiceIndex {
         &self.speakers[idx as usize]
     }
 
-    /// Speaker groups a voice belongs to (a line conditioned on several NPCs is under each).
+    /// Speaker groups a voice belongs to (a line conditioned on several NPCs is
+    /// under each; generic lines are under their race+sex leaf only).
     pub fn speakers_of_voice(&self, voice: u32) -> &[u32] {
         let i = voice as usize;
         &self.voice_speaker_ids[self.voice_speaker_offsets[i] as usize..self.voice_speaker_offsets[i + 1] as usize]
     }
 
-    /// The voices matching `query` grouped by speaker: `(speaker, matching voices)`.
-    /// Speakers whose label equals the query come first, then labels containing
-    /// it, then the rest, each in display order.
-    pub fn search_speakers(&self, query: &str) -> Vec<(u32, Vec<u32>)> {
+    /// Nesting depth of a speaker (0 = top level).
+    pub fn depth(&self, speaker: u32) -> usize {
+        let mut d = 0;
+        let mut cur = self.speakers[speaker as usize].parent;
+        while let Some(p) = cur {
+            d += 1;
+            cur = self.speakers[p as usize].parent;
+        }
+        d
+    }
+
+    /// 0 = label equals the query, 1 = contains it, 2 = no match; the best of
+    /// the speaker and its descendants.
+    fn label_rank(&self, speaker: u32, q: &str) -> u8 {
+        let sp = &self.speakers[speaker as usize];
+        let label = sp.label.to_lowercase();
+        let mine = if label == q { 0 } else if label.contains(q) { 1 } else { 2 };
+        sp.children.iter().fold(mine, |best, &c| best.min(self.label_rank(c, q)))
+    }
+
+    /// The voices matching `query` grouped by speaker. Top-level speakers whose
+    /// label (or a descendant's) equals the query come first, then labels
+    /// containing it, then the rest, each in display order. Nested nodes of the
+    /// generic tree get their own hit lists in `nested`.
+    pub fn search_speakers(&self, query: &str) -> SpeakerHits {
         let mut groups: Vec<Vec<u32>> = vec![Vec::new(); self.speakers.len()];
         for v in self.search(query) {
             for &sp in self.speakers_of_voice(v) {
                 groups[sp as usize].push(v);
+                let mut cur = self.speakers[sp as usize].parent;
+                while let Some(p) = cur {
+                    groups[p as usize].push(v);
+                    cur = self.speakers[p as usize].parent;
+                }
             }
         }
-        let mut out: Vec<(u32, Vec<u32>)> = groups.into_iter().enumerate().filter(|(_, g)| !g.is_empty()).map(|(sp, g)| (sp as u32, g)).collect();
+        let mut top: Vec<(u32, Vec<u32>)> = Vec::new();
+        let mut nested: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (sp, g) in groups.into_iter().enumerate() {
+            if g.is_empty() {
+                continue;
+            }
+            if self.speakers[sp].parent.is_none() {
+                top.push((sp as u32, g));
+            } else {
+                nested.insert(sp as u32, g);
+            }
+        }
         let q = query.trim().to_lowercase();
         if !q.is_empty() {
-            out.sort_by_key(|(sp, _)| {
-                let label = self.speakers[*sp as usize].label.to_lowercase();
-                if label == q {
-                    0
-                } else if label.contains(&q) {
-                    1
-                } else {
-                    2
-                }
-            });
+            top.sort_by_key(|(sp, _)| self.label_rank(*sp, &q));
         }
-        out
+        SpeakerHits { top, nested }
     }
 
     /// Who says it: the named speaker, else `Any <race> <sex>`.
@@ -338,27 +421,61 @@ mod tests {
     fn speaker_groups_cover_every_voice() {
         let idx = VoiceIndex::get();
         assert!(idx.speakers().len() > 1_000, "{}", idx.speakers().len());
-        let total: usize = idx.speakers().iter().map(|s| s.voices.len()).sum();
-        assert!(total >= idx.len());
         for (i, _) in idx.voices.iter().enumerate() {
             let sps = idx.speakers_of_voice(i as u32);
             assert!(!sps.is_empty());
             assert!(sps.iter().all(|&sp| idx.speaker(sp).voices.contains(&(i as u32))));
         }
-        // Ordered: NPCs, then factions, classes and race groups.
+        // Ordered: the generic root, NPCs, factions, classes, then the race/sex nodes.
         assert!(idx.speakers().windows(2).all(|w| w[0].kind <= w[1].kind));
         let sheo = idx.speakers().iter().find(|s| s.label == "Sheogorath").expect("Sheogorath");
         assert_eq!(sheo.kind, SpeakerKind::Npc);
         assert!(sheo.voices.len() > 100, "{}", sheo.voices.len());
-        assert!(idx.speakers().iter().any(|s| s.kind == SpeakerKind::Race && s.label == "Any Orc female"));
         assert!(idx.speakers().iter().any(|s| s.kind == SpeakerKind::Faction));
 
-        let groups = idx.search_speakers("sheogorath");
-        assert_eq!(idx.speaker(groups[0].0).label, "Sheogorath");
-        assert!(groups.len() > 1);
-        assert!(groups.iter().all(|(_, v)| !v.is_empty()));
+        // Generic tree: root -> race -> sex, unions all the way up.
+        let root = idx.speaker(0);
+        assert_eq!((root.kind, root.label, root.parent), (SpeakerKind::Generic, "Generic lines", None));
+        assert!(root.children.len() >= 10, "{} races", root.children.len());
+        assert!(root.voices.len() > 50_000, "{} generic lines", root.voices.len());
+        for &race in &root.children {
+            let r = idx.speaker(race);
+            assert_eq!((r.kind, r.parent), (SpeakerKind::Race, Some(0)));
+            assert!(!r.children.is_empty());
+            let union: usize = r.children.iter().map(|&c| idx.speaker(c).voices.len()).sum();
+            assert_eq!(union, r.voices.len());
+            for &leaf in &r.children {
+                let l = idx.speaker(leaf);
+                assert_eq!((l.kind, l.parent), (SpeakerKind::RaceSex, Some(race)));
+                assert!(l.label.starts_with(r.label), "{} under {}", l.label, r.label);
+                assert!(l.children.is_empty());
+                assert!(l.voices.iter().all(|&v| idx.speakers_of_voice(v) == [leaf]));
+            }
+        }
+        let orc_f = idx.speakers().iter().position(|s| s.kind == SpeakerKind::RaceSex && s.label == "Orc female").unwrap() as u32;
+        assert_eq!(idx.depth(orc_f), 2);
+        assert_eq!(idx.depth(0), 0);
+
+        let hits = idx.search_speakers("sheogorath");
+        assert_eq!(idx.speaker(hits.top[0].0).label, "Sheogorath");
+        assert!(hits.top.len() > 1);
+        assert!(hits.top.iter().all(|(_, v)| !v.is_empty()));
         let all = idx.search_speakers("");
-        assert_eq!(all.len(), idx.speakers().len());
+        assert_eq!(all.top.len(), idx.speakers().iter().filter(|s| s.parent.is_none()).count());
+        assert_eq!(all.top[0].0, 0, "the generic root comes first");
+        assert_eq!(all.top[0].1.len(), root.voices.len());
+        assert_eq!(all.nested.len(), idx.speakers().iter().filter(|s| s.parent.is_some()).count());
+        // A race query ranks the generic root first through its race node.
+        let orc = idx.search_speakers("orc female");
+        assert_eq!(orc.top[0].0, 0);
+        let orc_f_hits = orc.nested.get(&orc_f).map(|v| v.len()).unwrap_or(0);
+        assert!(orc_f_hits > 100, "{orc_f_hits}");
+        let orc_race = idx.speaker(orc_f).parent.unwrap();
+        assert!(orc.nested.get(&orc_race).map(|v| v.len()).unwrap_or(0) >= orc_f_hits);
+        // "generic" ranks the generic root first (the game also has a quest named Generic).
+        let g = idx.search_speakers("generic");
+        assert_eq!(g.top[0].0, 0);
+        assert_eq!(g.top[0].1.len(), root.voices.len());
     }
 
     #[test]

@@ -734,7 +734,7 @@ export component AppWindow inherits Window {
                                     spacing: 4px;
 
                                     if !root.is-dialogue-tab : ExpandChevron {
-                                        expandable: entry.variations > 1;
+                                        expandable: entry.variations > 1 || entry.status == "speaker";
                                         expanded: entry.expanded;
                                         name: entry.name;
                                         toggle => { root.toggle-expand(entry.event); }
@@ -749,7 +749,7 @@ export component AppWindow inherits Window {
                                             text: entry.name;
                                             color: entry.event == root.playing-event && root.playing-variation < 1 ? Theme.success : Theme.text-primary;
                                             font-size: entry.status == "speaker" ? 13px : 12px;
-                                            font-family: root.is-dialogue-tab ? "Segoe UI" : "Consolas";
+                                            font-family: root.is-dialogue-tab || entry.status == "speaker" ? "Segoe UI" : "Consolas";
                                             font-weight: entry.event == root.playing-event && root.playing-variation < 1 ? 700 : entry.status == "speaker" ? 600 : 400;
                                             overflow: elide;
                                         }
@@ -762,9 +762,9 @@ export component AppWindow inherits Window {
                                             overflow: elide;
                                         }
 
-                                        if root.is-dialogue-tab && entry.replacement == "" && entry.detail != "" : Text {
+                                        if (root.is-dialogue-tab || entry.status == "speaker") && entry.replacement == "" && entry.detail != "" : Text {
                                             text: entry.detail;
-                                            color: Theme.text-muted;
+                                            color: entry.warning ? Theme.warning : Theme.text-muted;
                                             font-size: 10px;
                                             overflow: elide;
                                         }
@@ -792,7 +792,7 @@ export component AppWindow inherits Window {
                                     width: root.is-music-tab ? 70px : 140px;
                                     text: root.is-music-tab
                                         ? (entry.replacement != "" ? "" : entry.size)
-                                        : entry.detail;
+                                        : entry.status == "speaker" ? "" : entry.detail;
                                     color: Theme.text-muted;
                                     font-size: 11px;
                                     vertical-alignment: center;
@@ -871,7 +871,7 @@ export component AppWindow inherits Window {
 
                                 Text {
                                     width: root.is-music-tab ? 80px : root.is-dialogue-tab ? 120px : 92px;
-                                    text: "\u{21b3} " + entry.group;
+                                    text: (root.is-dialogue-tab ? "" : "\u{21b3} ") + entry.group;
                                     color: Theme.text-muted;
                                     font-size: 11px;
                                     vertical-alignment: center;
@@ -928,6 +928,13 @@ export component AppWindow inherits Window {
 
                                     if root.is-dialogue-tab && entry.replacement == "" && entry.detail != "" : Text {
                                         text: entry.detail;
+                                        color: Theme.text-muted;
+                                        font-size: 10px;
+                                        overflow: elide;
+                                    }
+
+                                    if !root.is-dialogue-tab && entry.replacement == "" && entry.size != "" : Text {
+                                        text: entry.size;
                                         color: Theme.text-muted;
                                         font-size: 10px;
                                         overflow: elide;

@@ -30,7 +30,7 @@ mod wem_encoder;
 mod wem_info;
 
 use sfx_index::{SfxIndex, TabKind};
-use voice_index::VoiceIndex;
+use voice_index::{SpeakerKind, VoiceIndex};
 use wem_encoder::find_wwise_cli;
 
 slint::include_modules!();
@@ -425,12 +425,15 @@ fn group_by_source(queued: &[QueuedWem]) -> Vec<(PathBuf, Vec<QueuedWem>)> {
 const VOICE_ID: u32 = 0x4000_0000;
 /// Set together with `VOICE_ID`: a speaker group row of the Dialogue tab.
 const SPEAKER_ID: u32 = 0x2000_0000;
+/// Without `VOICE_ID`: the pinned "Shared audio" group of a sound tab (`SHARED_ID | tab`).
+const SHARED_ID: u32 = 0x2000_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SoundId {
     Event(u32),
     Voice(u32),
     Speaker(u32),
+    Shared(u32),
 }
 
 fn parse_id(id: u32) -> SoundId {
@@ -440,9 +443,65 @@ fn parse_id(id: u32) -> SoundId {
         } else {
             SoundId::Voice(id & !VOICE_ID)
         }
+    } else if id & SHARED_ID != 0 {
+        SoundId::Shared(id & !SHARED_ID)
     } else {
         SoundId::Event(id)
     }
+}
+
+/// Audio files used by more than one sound, per tab (listed in every tab one of
+/// their sounds is in), ordered by source name. Computed once.
+fn shared_wems(tab: usize) -> &'static [u32] {
+    static LISTS: std::sync::OnceLock<Vec<Vec<u32>>> = std::sync::OnceLock::new();
+    let lists = LISTS.get_or_init(|| {
+        let index = SfxIndex::get();
+        let mut lists: Vec<Vec<u32>> = vec![Vec::new(); index.tabs().len()];
+        for (wi, wem) in index.wems_iter() {
+            let users = index.events_sharing(wi);
+            if wem.plugin || users.len() < 2 {
+                continue;
+            }
+            let mut tabs: Vec<usize> = users.iter().map(|&e| index.event(e).tab as usize).collect();
+            tabs.sort_unstable();
+            tabs.dedup();
+            for t in tabs {
+                lists[t].push(wi);
+            }
+        }
+        for list in &mut lists {
+            list.sort_by_key(|&wi| (index.wem(wi).wav.unwrap_or("").to_ascii_lowercase(), index.wem(wi).id));
+        }
+        lists
+    });
+    lists.get(tab).map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// Shared files of `tab` whose source name, id, or using sounds (name/group)
+/// contain every token of `query`.
+fn search_shared(tab: usize, query: &str) -> Vec<u32> {
+    let index = SfxIndex::get();
+    let tokens: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
+    shared_wems(tab)
+        .iter()
+        .copied()
+        .filter(|&wi| {
+            if tokens.is_empty() {
+                return true;
+            }
+            let wem = index.wem(wi);
+            let mut hay = format!("{}|{}", wem.wav.unwrap_or(""), wem.id);
+            for &e in index.events_sharing(wi) {
+                let ev = index.event(e);
+                hay.push('|');
+                hay.push_str(ev.name);
+                hay.push('|');
+                hay.push_str(index.group(ev).name);
+            }
+            let hay = hay.to_lowercase();
+            tokens.iter().all(|t| hay.contains(t.as_str()))
+        })
+        .collect()
 }
 
 /// Validate an id coming from the UI.
@@ -454,6 +513,7 @@ fn sound_id(raw: i32) -> Option<SoundId> {
         SoundId::Event(e) if (e as usize) < SfxIndex::get().events().len() => Some(SoundId::Event(e)),
         SoundId::Voice(v) if (v as usize) < VoiceIndex::get().len() => Some(SoundId::Voice(v)),
         SoundId::Speaker(sp) if (sp as usize) < VoiceIndex::get().speakers().len() => Some(SoundId::Speaker(sp)),
+        SoundId::Shared(t) if (t as usize) < SfxIndex::get().tabs().len() => Some(SoundId::Shared(t)),
         _ => None,
     }
 }
@@ -470,6 +530,7 @@ fn event_display_name(index: &SfxIndex, id: u32) -> String {
         SoundId::Event(e) => index.event(e).name.to_string(),
         SoundId::Voice(v) => voice_display_name(v),
         SoundId::Speaker(sp) => VoiceIndex::get().speaker(sp).label.to_string(),
+        SoundId::Shared(_) => "Shared audio".to_string(),
     }
 }
 
@@ -478,6 +539,7 @@ fn tab_of_id(index: &SfxIndex, id: u32) -> usize {
     match parse_id(id) {
         SoundId::Event(e) => index.event(e).tab as usize,
         SoundId::Voice(_) | SoundId::Speaker(_) => index.tab_index(TabKind::Dialogue).unwrap_or(0),
+        SoundId::Shared(t) => t as usize,
     }
 }
 
@@ -487,6 +549,7 @@ fn group_of_id(index: &SfxIndex, id: u32) -> String {
         SoundId::Event(e) => index.group(index.event(e)).name.to_string(),
         SoundId::Voice(v) => VoiceIndex::get().speaker_label(v),
         SoundId::Speaker(sp) => VoiceIndex::get().speaker(sp).kind.label().to_string(),
+        SoundId::Shared(_) => "Shared".to_string(),
     }
 }
 
@@ -1167,6 +1230,10 @@ fn entry_for_voice(st: &AppState, voice: u32, kind: i32) -> TrackEntry {
     };
     let topic = if line.topic.is_empty() { "dialogue".to_string() } else { line.topic.to_string() };
     let sex = |female: bool| if female { "female" } else { "male" };
+    // Lines of the generic tree sit three levels deep (Generics > race > sex).
+    let leaf = vi.speakers_of_voice(voice).first().copied();
+    let leaf_depth = leaf.map(|sp| vi.depth(sp)).unwrap_or(0);
+    let generic = leaf.map(|sp| vi.speaker(sp).kind == SpeakerKind::RaceSex).unwrap_or(false);
     // The other race folders the game plays this very recording for.
     let mine = format!("{} {}", v.race, sex(v.female));
     let mut also: Vec<String> = vi
@@ -1181,7 +1248,15 @@ fn entry_for_voice(st: &AppState, voice: u32, kind: i32) -> TrackEntry {
         .collect();
     also.sort();
     also.dedup();
-    let mut detail = if kind == 1 { mine.clone() } else { format!("{} \u{00b7} {}", topic, mine) };
+    let mut detail = if kind == 1 {
+        if generic {
+            format!("every {} NPC says this", mine)
+        } else {
+            mine.clone()
+        }
+    } else {
+        format!("{} \u{00b7} {}", topic, mine)
+    };
     if v.voice_race != v.race {
         detail.push_str(&format!(" ({} actor)", v.voice_race));
     }
@@ -1200,7 +1275,7 @@ fn entry_for_voice(st: &AppState, voice: u32, kind: i32) -> TrackEntry {
         variation: if kind == 1 { 1 } else { 0 },
         expanded: false,
         length: wem_info::format_duration_ms(v.duration_ms).into(),
-        group: if kind == 1 { topic.into() } else { vi.speaker_label(voice).into() },
+        group: if kind == 1 { format!("{}\u{21b3} {}", "   ".repeat(leaf_depth), topic).into() } else { vi.speaker_label(voice).into() },
         name: text.into(),
         detail: detail.into(),
         size: String::new().into(),
@@ -1227,21 +1302,29 @@ fn format_total_ms(ms: u64) -> String {
 fn entry_for_speaker(st: &AppState, speaker: u32, hits: &[u32], expanded: bool) -> TrackEntry {
     let vi = VoiceIndex::get();
     let sp = vi.speaker(speaker);
+    let depth = vi.depth(speaker);
     let replaced = hits.iter().filter(|&&v| st.replacements.contains_key(&vi.voice(v).wem_id)).count();
     let total_ms: u64 = hits.iter().map(|&v| vi.voice(v).duration_ms as u64).sum();
     let n = hits.len();
-    let detail = if n < sp.voices.len() {
+    let count = if n < sp.voices.len() {
         format!("{} of {} lines match", n, sp.voices.len())
     } else {
         format!("{} line{}", n, if n == 1 { "" } else { "s" })
     };
+    // The generic tree is flagged: one edit there changes a mass of characters.
+    let (detail, warning) = match sp.kind {
+        SpeakerKind::Generic => (format!("{count} shared by every NPC of a race \u{2014} editing one changes a mass of characters"), true),
+        SpeakerKind::Race | SpeakerKind::RaceSex => (format!("{count} \u{00b7} every {} NPC says these", sp.label), false),
+        _ => (count, false),
+    };
+    let group = if depth == 0 { sp.kind.label().to_string() } else { format!("{}\u{21b3} {}", "   ".repeat(depth - 1), sp.kind.label()) };
     TrackEntry {
         event: (VOICE_ID | SPEAKER_ID | speaker) as i32,
         kind: 0,
         variation: 0,
         expanded,
         length: format_total_ms(total_ms).into(),
-        group: sp.kind.label().into(),
+        group: group.into(),
         name: sp.label.into(),
         detail: detail.into(),
         size: if replaced > 0 { format!("{replaced} edited") } else { String::new() }.into(),
@@ -1249,8 +1332,73 @@ fn entry_for_speaker(st: &AppState, speaker: u32, hits: &[u32], expanded: bool) 
         replacement: String::new().into(),
         variations: n as i32,
         shared: 0,
-        warning: false,
+        warning,
         can_play: false,
+    }
+}
+
+/// Pinned row of a sound tab: the audio files used by several sounds. `hits`
+/// are the ones matching the search.
+fn entry_for_shared_group(index: &SfxIndex, st: &AppState, tab: u32, hits: &[u32], expanded: bool) -> TrackEntry {
+    let replaced = hits.iter().filter(|&&wi| st.replacements.contains_key(&index.wem(wi).id)).count();
+    let total_ms: u64 = hits.iter().map(|&wi| index.wem(wi).duration_ms as u64).sum();
+    let all = shared_wems(tab as usize).len();
+    let n = hits.len();
+    let count = if n < all { format!("{n} of {all} files match") } else { format!("{n} file{}", if n == 1 { "" } else { "s" }) };
+    TrackEntry {
+        event: (SHARED_ID | tab) as i32,
+        kind: 0,
+        variation: 0,
+        expanded,
+        length: format_total_ms(total_ms).into(),
+        group: "Shared".into(),
+        name: "Shared audio".into(),
+        detail: format!("{count} used by several sounds \u{2014} editing one changes every sound that uses it").into(),
+        size: if replaced > 0 { format!("{replaced} edited") } else { String::new() }.into(),
+        status: "speaker".into(),
+        replacement: String::new().into(),
+        variations: n as i32,
+        shared: 0,
+        warning: true,
+        can_play: false,
+    }
+}
+
+/// One shared audio file under the pinned group. `variation` (1-based) is its
+/// position in `shared_wems(tab)`, so Play/Replace/Remove can find it again.
+fn entry_for_shared_wem(index: &SfxIndex, st: &AppState, tab: u32, wi: u32) -> TrackEntry {
+    let wem = index.wem(wi);
+    let users = index.events_sharing(wi);
+    let position = shared_wems(tab as usize).iter().position(|&x| x == wi).unwrap_or(0);
+    let replacement = st.replacements.get(&wem.id);
+    let status = if wem.plugin { "Plugin" } else if replacement.is_some() { "Edited" } else { "Original" };
+    let replacement_label = replacement
+        .map(|r| format!("{} (via {})", r.source.file_name().unwrap_or_default().to_string_lossy(), event_display_name(index, r.via)))
+        .unwrap_or_default();
+    let mut names: Vec<&str> = users.iter().map(|&e| index.event(e).name).collect();
+    names.sort_unstable();
+    let shown = names.iter().take(4).copied().collect::<Vec<_>>().join(", ");
+    let used_by = if names.len() > 4 {
+        format!("used by {} sounds: {}, +{} more", names.len(), shown, names.len() - 4)
+    } else {
+        format!("used by {} sounds: {}", names.len(), shown)
+    };
+    TrackEntry {
+        event: (SHARED_ID | tab) as i32,
+        kind: 1,
+        variation: position as i32 + 1,
+        expanded: false,
+        length: wem_info::format_duration_ms(wem.duration_ms).into(),
+        group: format!("{} sounds", users.len()).into(),
+        name: wem.wav.map(str::to_string).unwrap_or_else(|| format!("wem {}", wem.id)).into(),
+        detail: format!("id {}", wem.id).into(),
+        size: used_by.into(),
+        status: status.into(),
+        replacement: replacement_label.into(),
+        variations: 1,
+        shared: 0,
+        warning: false,
+        can_play: !wem.plugin && (st.game_root.is_some() || replacement.is_some()),
     }
 }
 
@@ -1290,7 +1438,8 @@ const PAGE_SIZE: usize = 50;
 
 /// Row references are packed into a `u32`: plain sound id for sound/speaker rows,
 /// `ROW_VARIATION | event << 16 | variation` for the rows of an expanded sound,
-/// `ROW_VARIATION | VOICE_ID | voice` for the lines of an expanded speaker.
+/// `ROW_VARIATION | VOICE_ID | voice` for the lines of an expanded speaker,
+/// `ROW_VARIATION | SHARED_ID | tab << 16 | position` for a shared audio file.
 const ROW_VARIATION: u32 = 0x8000_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1298,14 +1447,18 @@ enum RowRef {
     Event(u32),
     Variation { event: u32, index: usize },
     VoiceLine(u32),
+    /// `index` = position in the model's `pinned_hits`.
+    SharedWem { tab: u32, index: usize },
 }
 
 fn row_ref(row: u32) -> RowRef {
     if row & ROW_VARIATION != 0 {
         if row & VOICE_ID != 0 {
             RowRef::VoiceLine(row & !(ROW_VARIATION | VOICE_ID))
+        } else if row & SHARED_ID != 0 {
+            RowRef::SharedWem { tab: (row >> 16) & 0x1fff, index: (row & 0xffff) as usize }
         } else {
-            RowRef::Variation { event: (row >> 16) & 0x3fff, index: (row & 0xffff) as usize }
+            RowRef::Variation { event: (row >> 16) & 0x1fff, index: (row & 0xffff) as usize }
         }
     } else {
         RowRef::Event(row)
@@ -1320,11 +1473,35 @@ fn voice_line_row(voice: u32) -> u32 {
     ROW_VARIATION | VOICE_ID | voice
 }
 
+fn shared_row(tab: u32, index: usize) -> u32 {
+    ROW_VARIATION | SHARED_ID | (tab << 16) | (index as u32 & 0xffff)
+}
+
 impl RowRef {
     fn event(self) -> u32 {
         match self {
             RowRef::Event(e) | RowRef::Variation { event: e, .. } => e,
             RowRef::VoiceLine(v) => VOICE_ID | v,
+            RowRef::SharedWem { tab, .. } => SHARED_ID | tab,
+        }
+    }
+}
+
+/// Rows under an expanded speaker: its lines, or - in the generic tree - its
+/// children, each with their own expansion.
+fn push_speaker_children(rows: &mut Vec<u32>, speaker: u32, hits: &[u32], expanded: &HashSet<u32>, nested: &HashMap<u32, Vec<u32>>) {
+    let vi = VoiceIndex::get();
+    let sp = vi.speaker(speaker);
+    if sp.children.is_empty() {
+        rows.extend(hits.iter().map(|&v| voice_line_row(v)));
+        return;
+    }
+    for &child in &sp.children {
+        let Some(child_hits) = nested.get(&child).filter(|h| !h.is_empty()) else { continue };
+        let id = VOICE_ID | SPEAKER_ID | child;
+        rows.push(id);
+        if expanded.contains(&id) {
+            push_speaker_children(rows, child, child_hits, expanded, nested);
         }
     }
 }
@@ -1337,7 +1514,12 @@ struct InventoryModel {
     rows: RefCell<Vec<u32>>,
     /// Dialogue tab: the matching lines of each speaker in `filtered` (same order).
     voice_hits: RefCell<Vec<Vec<u32>>>,
+    /// Dialogue tab: matching lines of the nested race / sex nodes of the generic tree.
+    nested_hits: RefCell<HashMap<u32, Vec<u32>>>,
     lines_total: Cell<usize>,
+    /// Sound tabs: the "Shared audio" group pinned above page 1, and its matching files.
+    pinned: Cell<Option<u32>>,
+    pinned_hits: RefCell<Vec<u32>>,
     page: Cell<usize>,
     tab: Cell<usize>,
     expanded: RefCell<HashSet<u32>>,
@@ -1351,7 +1533,10 @@ impl InventoryModel {
             filtered: RefCell::new(Vec::new()),
             rows: RefCell::new(Vec::new()),
             voice_hits: RefCell::new(Vec::new()),
+            nested_hits: RefCell::new(HashMap::new()),
             lines_total: Cell::new(0),
+            pinned: Cell::new(None),
+            pinned_hits: RefCell::new(Vec::new()),
             page: Cell::new(0),
             tab: Cell::new(0),
             expanded: RefCell::new(HashSet::new()),
@@ -1364,16 +1549,23 @@ impl InventoryModel {
         let index = SfxIndex::get();
         let tab = tab.min(index.tabs().len().saturating_sub(1));
         let mut voice_hits: Vec<Vec<u32>> = Vec::new();
+        let mut nested_hits: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut pinned_hits: Vec<u32> = Vec::new();
         let mut filtered = if index.tabs()[tab].kind == TabKind::Dialogue {
-            let groups = VoiceIndex::get().search_speakers(query);
-            let ids = groups.iter().map(|(sp, _)| VOICE_ID | SPEAKER_ID | sp).collect();
-            voice_hits = groups.into_iter().map(|(_, v)| v).collect();
+            let hits = VoiceIndex::get().search_speakers(query);
+            let ids = hits.top.iter().map(|(sp, _)| VOICE_ID | SPEAKER_ID | sp).collect();
+            voice_hits = hits.top.into_iter().map(|(_, v)| v).collect();
+            nested_hits = hits.nested;
             ids
         } else {
+            pinned_hits = search_shared(tab, query);
             index.search(tab, query)
         };
         self.lines_total.set(voice_hits.iter().map(Vec::len).sum());
         *self.voice_hits.borrow_mut() = voice_hits;
+        *self.nested_hits.borrow_mut() = nested_hits;
+        self.pinned.set(if pinned_hits.is_empty() { None } else { Some(SHARED_ID | tab as u32) });
+        *self.pinned_hits.borrow_mut() = pinned_hits;
         if index.tabs()[tab].kind == TabKind::Music {
             filtered.sort_by_key(|&e| {
                 index.media_of(index.event(e)).next().map(|(_, w)| music_position(w.id)).unwrap_or(usize::MAX)
@@ -1395,6 +1587,12 @@ impl InventoryModel {
     /// Dialogue tab: lines matching the search across all listed speakers.
     fn lines_total(&self) -> usize {
         self.lines_total.get()
+    }
+
+    /// Rows shown above the page's sounds (the "Shared audio" group on page 1).
+    #[cfg(test)]
+    fn pinned_rows(&self) -> usize {
+        usize::from(self.page() == 0 && self.pinned.get().is_some())
     }
 
     fn page(&self) -> usize {
@@ -1443,9 +1641,17 @@ impl InventoryModel {
         let filtered = self.filtered.borrow();
         let expanded = self.expanded.borrow();
         let voice_hits = self.voice_hits.borrow();
+        let nested_hits = self.nested_hits.borrow();
+        let pinned_hits = self.pinned_hits.borrow();
         let start = (self.page.get() * PAGE_SIZE).min(filtered.len());
         let end = (start + PAGE_SIZE).min(filtered.len());
         let mut rows = Vec::with_capacity(end - start + 8);
+        if let (0, Some(pinned)) = (self.page.get(), self.pinned.get()) {
+            rows.push(pinned);
+            if let (true, SoundId::Shared(tab)) = (expanded.contains(&pinned), parse_id(pinned)) {
+                rows.extend((0..pinned_hits.len()).map(|i| shared_row(tab, i)));
+            }
+        }
         for (pos, &ev) in filtered[start..end].iter().enumerate() {
             rows.push(ev);
             if !expanded.contains(&ev) {
@@ -1457,17 +1663,19 @@ impl InventoryModel {
                         rows.push(variation_row(e, i));
                     }
                 }
-                SoundId::Speaker(_) => {
+                SoundId::Speaker(sp) => {
                     if let Some(hits) = voice_hits.get(start + pos) {
-                        rows.extend(hits.iter().map(|&v| voice_line_row(v)));
+                        push_speaker_children(&mut rows, sp, hits, &expanded, &nested_hits);
                     }
                 }
-                SoundId::Voice(_) => {}
+                SoundId::Voice(_) | SoundId::Shared(_) => {}
             }
         }
         drop(filtered);
         drop(expanded);
         drop(voice_hits);
+        drop(nested_hits);
+        drop(pinned_hits);
         *self.rows.borrow_mut() = rows;
         self.notify.reset();
     }
@@ -1479,13 +1687,27 @@ impl InventoryModel {
 
     /// Re-fetch the rows (sound and variation rows) of the given events, if visible.
     fn invalidate_events(&self, events: &[u32]) {
-        // A changed voice line also changes the counts on every speaker row.
+        // A changed voice line also changes the counts on every speaker row; a
+        // changed sound refreshes the shared-audio group and the files it uses.
+        let index = SfxIndex::get();
         let voice_changed = events.iter().any(|&e| e & VOICE_ID != 0);
+        let event_changed = events.iter().any(|&e| matches!(parse_id(e), SoundId::Event(_)));
         let rows = self.rows.borrow();
+        let pinned_hits = self.pinned_hits.borrow();
         for (pos, &row) in rows.iter().enumerate() {
             let r = row_ref(row);
-            let speaker_row = matches!(r, RowRef::Event(id) if matches!(parse_id(id), SoundId::Speaker(_)));
-            if events.contains(&r.event()) || (voice_changed && speaker_row) {
+            let hit = match r {
+                RowRef::Event(id) => match parse_id(id) {
+                    SoundId::Speaker(_) => voice_changed || events.contains(&id),
+                    SoundId::Shared(_) => event_changed || events.contains(&id),
+                    _ => events.contains(&id),
+                },
+                RowRef::SharedWem { index: i, .. } => {
+                    events.contains(&r.event()) || pinned_hits.get(i).is_some_and(|&wi| index.events_sharing(wi).iter().any(|e| events.contains(e)))
+                }
+                _ => events.contains(&r.event()),
+            };
+            if hit {
                 self.notify.row_changed(pos);
             }
         }
@@ -1510,12 +1732,24 @@ impl Model for InventoryModel {
                 SoundId::Speaker(sp) => {
                     let filtered = self.filtered.borrow();
                     let hits = self.voice_hits.borrow();
-                    let mine = filtered.iter().position(|&x| x == ev).and_then(|p| hits.get(p)).map(Vec::as_slice).unwrap_or(&[]);
+                    let nested = self.nested_hits.borrow();
+                    let mine: &[u32] = filtered
+                        .iter()
+                        .position(|&x| x == ev)
+                        .and_then(|p| hits.get(p))
+                        .map(Vec::as_slice)
+                        .or_else(|| nested.get(&sp).map(Vec::as_slice))
+                        .unwrap_or(&[]);
                     entry_for_speaker(&st, sp, mine, self.is_expanded(ev))
                 }
+                SoundId::Shared(tab) => entry_for_shared_group(index, &st, tab, &self.pinned_hits.borrow(), self.is_expanded(ev)),
             },
             RowRef::Variation { event, index: i } => entry_for_variation(index, &st, event, i),
             RowRef::VoiceLine(v) => entry_for_voice(&st, v, 1),
+            RowRef::SharedWem { tab, index: i } => {
+                let wi = *self.pinned_hits.borrow().get(i)?;
+                entry_for_shared_wem(index, &st, tab, wi)
+            }
         })
     }
 
@@ -1652,6 +1886,11 @@ fn load_preview(shared: &SharedState, id: u32, variation: i32) -> Result<Preview
             (voice.wem_id, true, voice_display_name(v))
         }
         SoundId::Speaker(_) => bail!("expand the speaker and play one of the lines"),
+        SoundId::Shared(tab) => {
+            let wi = shared_wems(tab as usize).get((variation.max(1) - 1) as usize).copied().context("no such shared file")?;
+            let wem = index.wem(wi);
+            (wem.id, wem.localised, format!("{} (used by {} sounds)", wem.wav.unwrap_or("shared audio"), index.events_sharing(wi).len()))
+        }
     };
 
     let st = state(shared);
@@ -1773,6 +2012,44 @@ fn replace_voice(app: &AppWindow, shared: &SharedState, model: &InventoryModel, 
     } else {
         set_status(app, "Ready", &format!("{} queued for replacement.", name), Tone::Success);
     }
+}
+
+/// Replace one shared audio file (pinned "Shared audio" group of a sound tab);
+/// `variation` is its 1-based position in `shared_wems(tab)`.
+fn replace_shared(app: &AppWindow, shared: &SharedState, model: &InventoryModel, tabs: &slint::VecModel<TabInfo>, tab: u32, variation: i32) {
+    let index = SfxIndex::get();
+    let Some(&wi) = shared_wems(tab as usize).get((variation.max(1) - 1) as usize) else { return };
+    let wem = index.wem(wi);
+    let users = index.events_sharing(wi);
+    let Some(via) = index.primary_event_of_wem(wi) else { return };
+    let name = wem.wav.unwrap_or("shared audio").to_string();
+    let dialog = rfd::FileDialog::new()
+        .set_title(format!("Replace {} (used by {} sounds)", name, users.len()))
+        .add_filter("Audio Files", &["mp3", "wav", "ogg", "flac", "wem"]);
+    let Some(source) = dialog.pick_file() else { return };
+    let fname = source.file_name().unwrap_or_default().to_string_lossy().to_string();
+    state(shared).replacements.insert(wem.id, Replacement { source, via });
+    let mut ids = users.to_vec();
+    ids.push(SHARED_ID | tab);
+    model.invalidate_events(&ids);
+    update_counts(app, shared, tabs);
+    append_log(app, &format!("Queued: {} (used by {} sounds) <- {}", name, users.len(), fname));
+    set_status(app, "Queued with a note", &format!("{} queued; every one of the {} sounds using it changes.", name, users.len()), Tone::Warning);
+}
+
+/// Clear the replacement of one shared audio file.
+fn remove_shared(app: &AppWindow, shared: &SharedState, model: &InventoryModel, tabs: &slint::VecModel<TabInfo>, tab: u32, variation: i32) {
+    let index = SfxIndex::get();
+    let Some(&wi) = shared_wems(tab as usize).get((variation.max(1) - 1) as usize) else { return };
+    let wem = index.wem(wi);
+    let name = wem.wav.unwrap_or("shared audio").to_string();
+    state(shared).replacements.remove(&wem.id);
+    let mut ids = index.events_sharing(wi).to_vec();
+    ids.push(SHARED_ID | tab);
+    model.invalidate_events(&ids);
+    update_counts(app, shared, tabs);
+    append_log(app, &format!("Removed: {} (shared audio)", name));
+    set_status(app, "Ready", &format!("{} replacement cleared.", name), Tone::Neutral);
 }
 
 /// Clear the replacement of one dialogue voice file.
@@ -1928,7 +2205,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     replace_voice(&app, &shared, &model, &tabs, v);
                     return;
                 }
-                None | Some(SoundId::Speaker(_)) => return,
+                None | Some(SoundId::Speaker(_) | SoundId::Shared(_)) => return,
             };
             let ev = index.event(event);
             let name = event_display_name(index, event);
@@ -2006,7 +2283,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     remove_voice(&app, &shared, &model, &tabs, v);
                     return;
                 }
-                None | Some(SoundId::Speaker(_)) => return,
+                None | Some(SoundId::Speaker(_) | SoundId::Shared(_)) => return,
             };
             let ev = index.event(event);
             let name = event_display_name(index, event);
@@ -2058,7 +2335,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let model = model.clone();
         app.on_toggle_expand(move |event| {
-            if !matches!(sound_id(event), Some(SoundId::Event(_) | SoundId::Speaker(_))) {
+            if !matches!(sound_id(event), Some(SoundId::Event(_) | SoundId::Speaker(_) | SoundId::Shared(_))) {
                 return;
             }
             // Defer past the current click sequence so the rows that appear never land
@@ -2075,9 +2352,16 @@ fn main() -> Result<(), slint::PlatformError> {
         let tabs = tabs_model.clone();
         app.on_replace_variation(move |event, variation| {
             let Some(app) = weak.upgrade() else { return };
-            if let Some(SoundId::Voice(v)) = sound_id(event) {
-                replace_voice(&app, &shared, &model, &tabs, v);
-                return;
+            match sound_id(event) {
+                Some(SoundId::Voice(v)) => {
+                    replace_voice(&app, &shared, &model, &tabs, v);
+                    return;
+                }
+                Some(SoundId::Shared(tab)) => {
+                    replace_shared(&app, &shared, &model, &tabs, tab, variation);
+                    return;
+                }
+                _ => {}
             }
             let index = SfxIndex::get();
             if event < 0 || event as usize >= index.events().len() || variation < 1 {
@@ -2121,9 +2405,16 @@ fn main() -> Result<(), slint::PlatformError> {
         let tabs = tabs_model.clone();
         app.on_remove_variation(move |event, variation| {
             let Some(app) = weak.upgrade() else { return };
-            if let Some(SoundId::Voice(v)) = sound_id(event) {
-                remove_voice(&app, &shared, &model, &tabs, v);
-                return;
+            match sound_id(event) {
+                Some(SoundId::Voice(v)) => {
+                    remove_voice(&app, &shared, &model, &tabs, v);
+                    return;
+                }
+                Some(SoundId::Shared(tab)) => {
+                    remove_shared(&app, &shared, &model, &tabs, tab, variation);
+                    return;
+                }
+                _ => {}
             }
             let index = SfxIndex::get();
             if event < 0 || event as usize >= index.events().len() || variation < 1 {
@@ -2818,7 +3109,8 @@ mod tests {
         let total = index.events_in_tab(creatures).len();
         assert_eq!(model.filtered_len(), total);
         assert_eq!(model.page_count(), (total + PAGE_SIZE - 1) / PAGE_SIZE);
-        assert_eq!(model.row_count(), PAGE_SIZE);
+        let p = model.pinned_rows();
+        assert_eq!(model.row_count(), PAGE_SIZE + p);
         assert_eq!(model.page_bounds(), (1, PAGE_SIZE));
 
         // Last page holds the remainder; paging past the end clamps.
@@ -2827,20 +3119,21 @@ mod tests {
         assert_eq!(model.row_count(), total - (model.page_count() - 1) * PAGE_SIZE);
         model.set_page(0);
 
-        // Expanding a sound inserts one row per variation right after it.
-        let first = model.row_data(0).unwrap();
+        // Expanding a sound inserts one row per variation right after it
+        // (the pinned "Shared audio" group, if any, sits above the first sound).
+        let first = model.row_data(p).unwrap();
         let ev = first.event as u32;
         let n = index.event(ev).media_count();
         assert!(n > 1);
         model.toggle_expand(ev);
-        assert_eq!(model.row_count(), PAGE_SIZE + n);
-        assert!(model.row_data(0).unwrap().expanded);
-        let v1 = model.row_data(1).unwrap();
+        assert_eq!(model.row_count(), PAGE_SIZE + p + n);
+        assert!(model.row_data(p).unwrap().expanded);
+        let v1 = model.row_data(p + 1).unwrap();
         assert_eq!((v1.kind, v1.variation, v1.event), (1, 1, ev as i32));
-        assert_eq!(model.row_data(n).unwrap().variation, n as i32);
-        assert_eq!(model.row_data(n + 1).unwrap().kind, 0);
+        assert_eq!(model.row_data(p + n).unwrap().variation, n as i32);
+        assert_eq!(model.row_data(p + n + 1).unwrap().kind, 0);
         model.toggle_expand(ev);
-        assert_eq!(model.row_count(), PAGE_SIZE);
+        assert_eq!(model.row_count(), PAGE_SIZE + p);
 
         // Search covers the whole tab, not just the page; switching tabs clears expansion.
         model.set_view(creatures, "horse");
@@ -2849,6 +3142,114 @@ mod tests {
         assert_eq!(model.page_bounds(), (1, model.filtered_len()));
         assert_eq!(row_ref(variation_row(1234, 7)), RowRef::Variation { event: 1234, index: 7 });
         assert_eq!(row_ref(42), RowRef::Event(42));
+        assert_eq!(row_ref(shared_row(3, 9)), RowRef::SharedWem { tab: 3, index: 9 });
+        assert_eq!(row_ref(voice_line_row(77)), RowRef::VoiceLine(77));
+        assert_eq!(parse_id(SHARED_ID | 3), SoundId::Shared(3));
+        assert_eq!(parse_id(VOICE_ID | SPEAKER_ID | 5), SoundId::Speaker(5));
+    }
+
+    #[test]
+    fn shared_audio_group_lists_files_used_by_several_sounds() {
+        let shared: SharedState = Arc::new(Mutex::new(AppState { game_root: None, music_files: HashMap::new(), preview_pak: PreviewSlot::default(), replacements: Replacements::new(), audio: None }));
+        let index = SfxIndex::get();
+        let model = InventoryModel::new(shared.clone());
+        let ui = index.tab_index(TabKind::MenuUi).unwrap();
+        assert!(shared_wems(ui).len() > 20, "{}", shared_wems(ui).len());
+        assert!(shared_wems(ui).iter().all(|&wi| index.events_sharing(wi).len() > 1 && !index.wem(wi).plugin));
+
+        model.set_view(ui, "");
+        assert_eq!(model.pinned_rows(), 1);
+        let group = model.row_data(0).unwrap();
+        assert_eq!((group.kind, group.status.as_str(), group.name.as_str(), group.group.as_str()), (0, "speaker", "Shared audio", "Shared"));
+        assert!(group.warning && !group.can_play);
+        assert_eq!(group.variations as usize, shared_wems(ui).len());
+        assert_eq!(sound_id(group.event), Some(SoundId::Shared(ui as u32)));
+        assert_eq!(tab_of_id(index, group.event as u32), ui);
+        // The first real sound follows the pinned group; page 2 has no pinned row.
+        assert_eq!(model.row_data(1).unwrap().kind, 0);
+        assert!(matches!(sound_id(model.row_data(1).unwrap().event), Some(SoundId::Event(_))));
+        model.set_page(1);
+        assert_eq!(model.pinned_rows(), 0);
+        model.set_page(0);
+
+        // Expanding lists one row per shared file, addressed by its position in shared_wems.
+        model.toggle_expand(group.event as u32);
+        let rows = model.row_count();
+        assert_eq!(rows, PAGE_SIZE + 1 + shared_wems(ui).len());
+        let file = model.row_data(1).unwrap();
+        assert_eq!((file.kind, file.event), (1, group.event));
+        assert!(file.variation >= 1);
+        assert!(file.size.starts_with("used by "), "{}", file.size);
+        let wi = shared_wems(ui)[file.variation as usize - 1];
+        assert_eq!(file.name.as_str(), index.wem(wi).wav.unwrap_or(""));
+
+        // Replacing it is keyed by the wem and attributed to its primary sound.
+        let via = index.primary_event_of_wem(wi).unwrap();
+        state(&shared).replacements.insert(index.wem(wi).id, Replacement { source: PathBuf::from(r"C:\sfx\click.wav"), via });
+        assert_eq!(model.row_data(1).unwrap().status.as_str(), "Edited");
+        assert!(model.row_data(1).unwrap().replacement.contains("via"));
+        assert_eq!(model.row_data(0).unwrap().size.as_str(), "1 edited");
+        assert_eq!(tab_of_id(index, via), index.event(via).tab as usize);
+
+        // The search also filters the shared files (by source name or using sound).
+        model.set_view(ui, "select");
+        assert_eq!(model.pinned_rows(), 1);
+        assert!(model.row_data(0).unwrap().variations > 0);
+        assert!((model.row_data(0).unwrap().variations as usize) < shared_wems(ui).len());
+        model.set_view(ui, "zzzz-nothing");
+        assert_eq!(model.pinned_rows(), 0);
+    }
+
+    #[test]
+    fn generic_tree_expands_race_then_sex_then_lines() {
+        let shared: SharedState = Arc::new(Mutex::new(AppState { game_root: None, music_files: HashMap::new(), preview_pak: PreviewSlot::default(), replacements: Replacements::new(), audio: None }));
+        let index = SfxIndex::get();
+        let vi = VoiceIndex::get();
+        let model = InventoryModel::new(shared);
+        let dialogue = index.tab_index(TabKind::Dialogue).unwrap();
+        model.set_view(dialogue, "");
+        assert_eq!(model.pinned_rows(), 0);
+        let root = model.row_data(0).unwrap();
+        assert_eq!((root.kind, root.status.as_str(), root.name.as_str(), root.group.as_str()), (0, "speaker", "Generic lines", "Generic"));
+        assert!(root.warning, "generic root is flagged as a mass edit");
+        assert!(root.detail.contains("mass"), "{}", root.detail);
+        let races = vi.speaker(0).children.len();
+        assert!(races >= 10);
+        let rid = root.event as u32;
+
+        model.toggle_expand(rid);
+        assert_eq!(model.row_count(), PAGE_SIZE + races);
+        let race = model.row_data(1).unwrap();
+        assert_eq!((race.kind, race.status.as_str(), race.group.as_str()), (0, "speaker", "\u{21b3} Race"));
+        assert!(!race.warning);
+        assert!(race.detail.contains("every"), "{}", race.detail);
+        let SoundId::Speaker(race_sp) = parse_id(race.event as u32) else { panic!() };
+        assert_eq!(vi.depth(race_sp), 1);
+        let sexes = vi.speaker(race_sp).children.len();
+        assert!(sexes >= 1);
+
+        model.toggle_expand(race.event as u32);
+        assert_eq!(model.row_count(), PAGE_SIZE + races + sexes);
+        let sex = model.row_data(2).unwrap();
+        assert_eq!((sex.kind, sex.status.as_str(), sex.group.as_str()), (0, "speaker", "   \u{21b3} Sex"));
+        assert!(sex.name.starts_with(race.name.as_str()), "{} under {}", sex.name, race.name);
+        let SoundId::Speaker(sex_sp) = parse_id(sex.event as u32) else { panic!() };
+        assert_eq!(vi.depth(sex_sp), 2);
+        let n = sex.variations as usize;
+        assert!(n > 100);
+
+        model.toggle_expand(sex.event as u32);
+        assert_eq!(model.row_count(), PAGE_SIZE + races + sexes + n);
+        let line = model.row_data(3).unwrap();
+        assert_eq!(line.kind, 1);
+        assert!(line.group.starts_with("      \u{21b3} "), "{}", line.group);
+        assert!(line.detail.starts_with("every "), "{}", line.detail);
+        assert!(matches!(sound_id(line.event), Some(SoundId::Voice(_))));
+        // A named NPC's line is not indented.
+        model.set_view(dialogue, "sheogorath");
+        let sheo = model.row_data(0).unwrap();
+        model.toggle_expand(sheo.event as u32);
+        assert!(model.row_data(1).unwrap().group.starts_with("\u{21b3} "));
     }
 
     #[test]
