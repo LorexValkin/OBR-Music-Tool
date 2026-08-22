@@ -681,13 +681,7 @@ export component AppWindow inherits Window {
                         vertical-stretch: 1;
 
                         for entry[index] in root.track-list : Rectangle {
-                            // Variation rows grow in instead of popping into place.
-                            property <bool> shown: false;
-                            init => { shown = true; }
-                            height: (entry.kind == 1 && !shown) ? 0px : 36px;
-                            animate height { duration: 180ms; easing: ease-out; }
-                            opacity: (entry.kind == 1 && !shown) ? 0 : 1;
-                            animate opacity { duration: 180ms; easing: ease-out; }
+                            height: 36px;
                             clip: true;
                             background: entry.kind == 1 ? Theme.surface-muted.transparentize(0.5)
                                 : touch-row.has-hover ? Theme.surface-raised
