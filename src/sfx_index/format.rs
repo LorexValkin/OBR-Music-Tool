@@ -32,9 +32,6 @@ pub const GROUP_REC_SIZE: usize = 16;
 pub const EVENT_REC_SIZE: usize = 20;
 pub const WEM_REC_SIZE: usize = 20;
 
-/// Index flags.
-pub const INDEX_FLAG_VOICE: u16 = 1;
-
 /// Event flags.
 pub const EV_PREFETCH_SUSPECT: u8 = 1;
 pub const EV_HAS_SHARED_MEDIA: u8 = 2;
@@ -157,7 +154,7 @@ fn put_u32(out: &mut Vec<u8>, v: u32) {
 }
 
 fn pad4(out: &mut Vec<u8>) {
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }
@@ -522,7 +519,7 @@ impl<'a> RawIndex<'a> {
 
     /// Decode back into owned tables (used by tests and the builder's `--check`).
     #[allow(dead_code)]
-    pub fn to_tables(&self) -> Tables {
+    pub fn to_tables(self) -> Tables {
         let h = &self.header;
         Tables {
             flags: h.flags,

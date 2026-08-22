@@ -137,7 +137,7 @@ pub fn decode_entry(enc: &[u8], offset: usize) -> Result<PakEntry> {
                 let len = u32_at(enc, c)? as u64;
                 c += 4;
                 blocks.push((start, start + len));
-                start += (len + align - 1) / align * align;
+                start += len.div_ceil(align) * align;
             }
         }
     }

@@ -280,8 +280,8 @@ impl<'a> RawVoiceIndex<'a> {
             }
             let id = raw.voice(bw as usize).wem_id;
             if let Some(p) = prev_wem {
-                if id <= p {
-                    return err("by_wem is not strictly ascending");
+                if id < p {
+                    return err("by_wem is not sorted by wem id");
                 }
             }
             prev_wem = Some(id);
@@ -328,7 +328,7 @@ impl<'a> RawVoiceIndex<'a> {
     }
 
     #[allow(dead_code)]
-    pub fn to_tables(&self) -> Tables {
+    pub fn to_tables(self) -> Tables {
         let h = &self.header;
         Tables {
             fingerprint: h.fingerprint,

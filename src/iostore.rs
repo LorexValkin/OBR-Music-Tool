@@ -15,9 +15,11 @@ const TOC_HEADER_SIZE: usize = 144;
 const INVALID_INDEX: u32 = u32::MAX;
 
 /// Container flag bits (`EIoContainerFlags`).
+#[cfg_attr(not(test), allow(dead_code))]
 pub const FLAG_COMPRESSED: u8 = 1;
 pub const FLAG_ENCRYPTED: u8 = 2;
 pub const FLAG_SIGNED: u8 = 4;
+#[cfg_attr(not(test), allow(dead_code))]
 pub const FLAG_INDEXED: u8 = 8;
 
 /// One 12-byte compression block entry.
@@ -361,10 +363,6 @@ impl Utoc {
         let last = ((offset + length).max(offset + 1) - 1) / bs;
         let end = (last as usize + 1).min(self.blocks.len());
         Some(first.min(end)..end)
-    }
-
-    pub fn block(&self, index: usize) -> Option<&CompressedBlock> {
-        self.blocks.get(index)
     }
 
     /// Name of the compression method used by a block (`"None"` for raw blocks).

@@ -30,12 +30,42 @@ export struct TrackEntry {
     name: string,         // Music: track name; sounds: event name (ui_menu_ok)
     detail: string,       // sounds: source wav of the first variation
     size: string,         // Music: preview file size or "packed"
-    status: string,       // "vanilla" | "replace" | "partial"
+    status: string,       // "Original" | "Edited" | "Partial" | "Plugin" | "speaker" (Dialogue group rows)
     replacement: string,  // queued file name, "" when none
     variations: int,      // number of audio files behind this sound
     shared: int,          // other sounds that share audio with this one
     warning: bool,        // may not replace cleanly (bank embeds a copy)
     can-play: bool,       // preview available (music with a loose mp3)
+}
+
+// Expand/collapse arrow of a sound or speaker row (keyboard/UIA: "Expand <name>").
+component ExpandChevron inherits Rectangle {
+    in property <bool> expandable;
+    in property <bool> expanded;
+    in property <string> name;
+    callback toggle();
+
+    width: 16px;
+    accessible-role: button;
+    accessible-label: (root.expanded ? "Collapse " : "Expand ") + root.name;
+    accessible-action-default => { root.toggle(); }
+
+    if root.expandable : Text {
+        text: "\u{25b8}";
+        rotation-angle: root.expanded ? 90deg : 0deg;
+        animate rotation-angle { duration: 160ms; easing: ease-in-out; }
+        color: area.has-hover ? Theme.text-primary : Theme.text-muted;
+        font-size: 13px;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+        width: 16px;
+        height: 100%;
+    }
+
+    area := TouchArea {
+        enabled: root.expandable;
+        clicked => { root.toggle(); }
+    }
 }
 
 export component AppWindow inherits Window {
@@ -45,6 +75,12 @@ export component AppWindow inherits Window {
     preferred-height: 850px;
     min-width: 1000px;
     min-height: 720px;
+    // Narrow windows: two-row tab strip, slimmer Setup panel, no Source-file column.
+    // Set imperatively (not bound to width) so layout constraints cannot feed back
+    // into the window size.
+    property <bool> compact: false;
+    changed width => { root.compact = root.width < 1150px; }
+    property <bool> show-source-column: !root.is-dialogue-tab && !root.compact;
 
     in-out property <string> application-version: "";
     in-out property <string> game-path: "";
@@ -62,6 +98,10 @@ export component AppWindow inherits Window {
     in-out property <int> page-count: 1;
     in-out property <int> page-first: 0;     // 1-based sound numbers shown on this page
     in-out property <int> page-last: 0;
+    in-out property <int> tab-lines: 0;      // Dialogue: lines matching the search (tab-total counts speakers)
+    in-out property <string> tip-text: "";   // hover tooltip with the full dialogue line
+    in-out property <length> tip-x: 0px;
+    in-out property <length> tip-y: 0px;
 
     in-out property <string> status-title: "Ready";
     in-out property <string> status-message: "Choose a game folder, then replace music and sound effects.";
@@ -132,6 +172,7 @@ export component AppWindow inherits Window {
     background: Theme.window-background;
 
     init => {
+        root.compact = root.width < 1150px;
         Palette.color-scheme = ColorScheme.dark;
     }
 
@@ -223,7 +264,7 @@ export component AppWindow inherits Window {
             vertical-stretch: 1;
 
             Rectangle {
-                width: 420px;
+                width: root.compact ? 390px : 420px;
                 horizontal-stretch: 0;
                 background: Theme.surface;
                 border-color: Theme.border;
@@ -531,8 +572,12 @@ export component AppWindow inherits Window {
                             }
                             Text {
                                 text: root.tabs.length == 0 ? ""
-                                    : root.tabs[root.current-tab].label + " · " + root.tab-total
-                                    + (root.tab-total == 1 ? " sound" : " sounds")
+                                    : root.is-dialogue-tab
+                                        ? (root.tabs[root.current-tab].label + " · " + root.tab-total
+                                            + (root.tab-total == 1 ? " speaker · " : " speakers · ") + root.tab-lines
+                                            + (root.tab-lines == 1 ? " line" : " lines"))
+                                        : (root.tabs[root.current-tab].label + " · " + root.tab-total
+                                            + (root.tab-total == 1 ? " sound" : " sounds"))
                                     + " · Play previews the original audio"
                                     + (root.is-music-tab ? "" : " · \u{25b8} shows a sound's variations");
                                 color: Theme.text-muted;
@@ -554,6 +599,7 @@ export component AppWindow inherits Window {
                     TabBar {
                         tabs: root.tabs;
                         current <=> root.current-tab;
+                        two-rows: root.compact;
                         enabled: !root.build-running;
                         selected(i) => { root.tab-selected(i); }
                     }
@@ -573,7 +619,7 @@ export component AppWindow inherits Window {
 
                             Text {
                                 width: root.is-music-tab ? 80px : root.is-dialogue-tab ? 120px : 92px;
-                                text: root.is-music-tab ? "Category" : root.is-dialogue-tab ? "Speaker" : "Group";
+                                text: root.is-music-tab ? "Category" : "Group";
                                 color: Theme.text-muted;
                                 font-size: 11px;
                                 font-weight: 700;
@@ -581,13 +627,13 @@ export component AppWindow inherits Window {
                             }
                             Text {
                                 horizontal-stretch: 1;
-                                text: root.is-music-tab ? "Filename" : root.is-dialogue-tab ? "Line" : "Sound";
+                                text: root.is-music-tab ? "Filename" : root.is-dialogue-tab ? "Speaker / line" : "Sound";
                                 color: Theme.text-muted;
                                 font-size: 11px;
                                 font-weight: 700;
                                 vertical-alignment: center;
                             }
-                            if !root.is-dialogue-tab : Text {
+                            if root.show-source-column : Text {
                                 width: root.is-music-tab ? 70px : 140px;
                                 text: root.is-music-tab ? "Size" : "Source file";
                                 color: Theme.text-muted;
@@ -651,7 +697,7 @@ export component AppWindow inherits Window {
                             // Double-click anywhere on a sound row to show/hide its variations.
                             touch-row := TouchArea {
                                 double-clicked => {
-                                    if (entry.kind == 0 && entry.variations > 1) {
+                                    if (entry.kind == 0 && (entry.variations > 1 || entry.status == "speaker")) {
                                         root.toggle-expand(entry.event);
                                     }
                                 }
@@ -673,8 +719,15 @@ export component AppWindow inherits Window {
                                 padding-right: 12px;
                                 spacing: 8px;
 
+                                if root.is-dialogue-tab : ExpandChevron {
+                                    expandable: entry.status == "speaker";
+                                    expanded: entry.expanded;
+                                    name: entry.name;
+                                    toggle => { root.toggle-expand(entry.event); }
+                                }
+
                                 Text {
-                                    width: root.is-music-tab ? 80px : root.is-dialogue-tab ? 120px : 92px;
+                                    width: root.is-music-tab ? 80px : root.is-dialogue-tab ? 96px : 92px;
                                     text: entry.group;
                                     color: Theme.text-secondary;
                                     font-size: 12px;
@@ -686,26 +739,11 @@ export component AppWindow inherits Window {
                                     horizontal-stretch: 1;
                                     spacing: 4px;
 
-                                    Rectangle {
-                                        width: 16px;
-                                        accessible-role: button;
-                                        accessible-label: (entry.expanded ? "Collapse " : "Expand ") + entry.name;
-                                        accessible-action-default => { root.toggle-expand(entry.event); }
-                                        if entry.variations > 1 : Text {
-                                            text: "\u{25b8}";
-                                            rotation-angle: entry.expanded ? 90deg : 0deg;
-                                            animate rotation-angle { duration: 160ms; easing: ease-in-out; }
-                                            color: chevron.has-hover ? Theme.text-primary : Theme.text-muted;
-                                            font-size: 13px;
-                                            vertical-alignment: center;
-                                            horizontal-alignment: center;
-                                            width: 16px;
-                                            height: 100%;
-                                        }
-                                        chevron := TouchArea {
-                                            enabled: entry.variations > 1;
-                                            clicked => { root.toggle-expand(entry.event); }
-                                        }
+                                    if !root.is-dialogue-tab : ExpandChevron {
+                                        expandable: entry.variations > 1;
+                                        expanded: entry.expanded;
+                                        name: entry.name;
+                                        toggle => { root.toggle-expand(entry.event); }
                                     }
 
                                     VerticalLayout {
@@ -716,9 +754,9 @@ export component AppWindow inherits Window {
                                         Text {
                                             text: entry.name;
                                             color: entry.event == root.playing-event && root.playing-variation < 1 ? Theme.success : Theme.text-primary;
-                                            font-size: 12px;
+                                            font-size: entry.status == "speaker" ? 13px : 12px;
                                             font-family: root.is-dialogue-tab ? "Segoe UI" : "Consolas";
-                                            font-weight: entry.event == root.playing-event && root.playing-variation < 1 ? 700 : 400;
+                                            font-weight: entry.event == root.playing-event && root.playing-variation < 1 ? 700 : entry.status == "speaker" ? 600 : 400;
                                             overflow: elide;
                                         }
 
@@ -737,14 +775,14 @@ export component AppWindow inherits Window {
                                             overflow: elide;
                                         }
 
-                                        if entry.status == "plugin" : Text {
+                                        if entry.status == "Plugin" : Text {
                                             text: "generated by a Wwise plugin (no audio file) \u{00b7} cannot be replaced";
                                             color: Theme.text-muted;
                                             font-size: 10px;
                                             overflow: elide;
                                         }
 
-                                        if entry.status != "plugin" && entry.replacement == "" && (entry.variations > 1 || entry.shared > 0 || entry.warning) : Text {
+                                        if entry.status != "Plugin" && entry.status != "speaker" && entry.replacement == "" && (entry.variations > 1 || entry.shared > 0 || entry.warning) : Text {
                                             text: (entry.variations > 1 ? entry.variations + " variations" : "")
                                                 + (entry.variations > 1 && entry.shared > 0 ? " \u{00b7} " : "")
                                                 + (entry.shared > 0 ? "shares audio with " + entry.shared + (entry.shared == 1 ? " other sound" : " other sounds") : "")
@@ -756,7 +794,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
 
-                                if !root.is-dialogue-tab : Text {
+                                if root.show-source-column : Text {
                                     width: root.is-music-tab ? 70px : 140px;
                                     text: root.is-music-tab
                                         ? (entry.replacement != "" ? "" : entry.size)
@@ -779,9 +817,9 @@ export component AppWindow inherits Window {
 
                                 Text {
                                     width: 80px;
-                                    text: entry.status;
-                                    color: entry.status == "vanilla" || entry.status == "plugin" ? Theme.text-muted
-                                        : entry.status == "replace" ? Theme.warning
+                                    text: entry.status == "speaker" ? entry.size : entry.status;
+                                    color: entry.status == "Original" || entry.status == "Plugin" ? Theme.text-muted
+                                        : entry.status == "Edited" ? Theme.warning
                                         : Theme.success;
                                     font-size: 11px;
                                     font-weight: 600;
@@ -812,7 +850,7 @@ export component AppWindow inherits Window {
                                             }
                                         }
 
-                                        if entry.status != "replace" && entry.status != "plugin" : Button {
+                                        if entry.status != "Edited" && entry.status != "Plugin" && entry.status != "speaker" : Button {
                                             text: "Replace";
                                             width: 78px;
                                             height: 26px;
@@ -820,7 +858,7 @@ export component AppWindow inherits Window {
                                             clicked => { root.replace-track(entry.event); }
                                         }
 
-                                        if entry.status == "replace" || entry.status == "partial" : Button {
+                                        if entry.status == "Edited" || entry.status == "Partial" : Button {
                                             text: "Remove";
                                             width: 78px;
                                             height: 26px;
@@ -851,13 +889,40 @@ export component AppWindow inherits Window {
                                     alignment: center;
                                     spacing: 1px;
 
-                                    Text {
-                                        text: entry.name;
-                                        color: entry.event == root.playing-event && root.playing-variation == entry.variation ? Theme.success : Theme.text-secondary;
-                                        font-size: 11px;
-                                        font-family: "Consolas";
-                                        font-weight: entry.event == root.playing-event && root.playing-variation == entry.variation ? 700 : 400;
-                                        overflow: elide;
+                                    Rectangle {
+                                        height: line-text.preferred-height;
+
+                                        line-text := Text {
+                                            width: 100%;
+                                            text: entry.name;
+                                            color: entry.event == root.playing-event && root.playing-variation == entry.variation ? Theme.success
+                                                : root.is-dialogue-tab ? Theme.text-primary : Theme.text-secondary;
+                                            font-size: root.is-dialogue-tab ? 12px : 11px;
+                                            font-family: root.is-dialogue-tab ? "Segoe UI" : "Consolas";
+                                            font-weight: entry.event == root.playing-event && root.playing-variation == entry.variation ? 700 : 400;
+                                            overflow: elide;
+                                        }
+
+                                        // Hovering a dialogue line shows the whole text in a tooltip.
+                                        if root.is-dialogue-tab : TouchArea {
+                                            Timer {
+                                                interval: 350ms;
+                                                running: parent.has-hover;
+                                                triggered => {
+                                                    // Only when the line is actually cut off.
+                                                    if (line-text.preferred-width > line-text.width + 1px) {
+                                                        root.tip-text = entry.name;
+                                                        root.tip-x = parent.absolute-position.x;
+                                                        root.tip-y = parent.absolute-position.y + parent.height + 6px;
+                                                    }
+                                                }
+                                            }
+                                            changed has-hover => {
+                                                if (!self.has-hover) {
+                                                    root.tip-text = "";
+                                                }
+                                            }
+                                        }
                                     }
 
                                     if entry.replacement != "" : Text {
@@ -867,7 +932,14 @@ export component AppWindow inherits Window {
                                         overflow: elide;
                                     }
 
-                                    if entry.replacement == "" && entry.shared > 0 : Text {
+                                    if root.is-dialogue-tab && entry.replacement == "" && entry.detail != "" : Text {
+                                        text: entry.detail;
+                                        color: Theme.text-muted;
+                                        font-size: 10px;
+                                        overflow: elide;
+                                    }
+
+                                    if !root.is-dialogue-tab && entry.replacement == "" && entry.shared > 0 : Text {
                                         text: "shares audio with " + entry.shared + (entry.shared == 1 ? " other sound" : " other sounds");
                                         color: Theme.text-muted;
                                         font-size: 10px;
@@ -875,7 +947,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
 
-                                Text {
+                                if root.show-source-column : Text {
                                     width: root.is-music-tab ? 70px : 140px;
                                     text: entry.detail;
                                     color: Theme.text-muted;
@@ -897,7 +969,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     width: 80px;
                                     text: entry.status;
-                                    color: entry.status == "vanilla" ? Theme.text-muted : Theme.warning;
+                                    color: entry.status == "Original" ? Theme.text-muted : Theme.warning;
                                     font-size: 11px;
                                     font-weight: 600;
                                     vertical-alignment: center;
@@ -927,7 +999,7 @@ export component AppWindow inherits Window {
                                             }
                                         }
 
-                                        if entry.status != "replace" && entry.status != "plugin" : Button {
+                                        if entry.status != "Edited" && entry.status != "Plugin" : Button {
                                             text: "Replace";
                                             width: 78px;
                                             height: 26px;
@@ -935,7 +1007,7 @@ export component AppWindow inherits Window {
                                             clicked => { root.replace-variation(entry.event, entry.variation); }
                                         }
 
-                                        if entry.status == "replace" || entry.status == "partial" : Button {
+                                        if entry.status == "Edited" || entry.status == "Partial" : Button {
                                             text: "Remove";
                                             width: 78px;
                                             height: 26px;
@@ -956,7 +1028,7 @@ export component AppWindow inherits Window {
 
                         Text {
                             horizontal-stretch: 1;
-                            text: "Sounds " + root.page-first + "\u{2013}" + root.page-last + " of " + root.tab-total
+                            text: (root.is-dialogue-tab ? "Speakers " : "Sounds ") + root.page-first + "\u{2013}" + root.page-last + " of " + root.tab-total
                                 + (root.search-text != "" ? " matching \"" + root.search-text + "\"" : "");
                             color: Theme.text-muted;
                             font-size: 11px;
@@ -1274,6 +1346,48 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    // Hover tooltip: the full dialogue line (set by the line rows via tip-text).
+    if root.tip-text != "" : Rectangle {
+        // Sized to the text: its natural single-line width (measured by the hidden
+        // Text below) up to 640px or the window, wrapping onto more lines beyond that.
+        property <length> max-w: min(640px, root.width - 16px);
+        width: min(tip-measure.preferred-width + 22px, max-w);
+        height: tip-layout.preferred-height;
+        x: max(8px, min(root.tip-x, root.width - self.width - 8px));
+        y: root.tip-y + self.height + 8px > root.height ? root.tip-y - self.height - 36px : root.tip-y;
+        background: #1b1b1f;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: #44444c;
+        drop-shadow-blur: 14px;
+        drop-shadow-offset-y: 3px;
+        drop-shadow-color: #00000099;
+
+        tip-measure := Text {
+            visible: false;
+            text: root.tip-text;
+            font-size: 12px;
+        }
+
+        tip-layout := VerticalLayout {
+            padding: 10px;
+
+            Text {
+                text: root.tip-text;
+                wrap: word-wrap;
+                font-size: 12px;
+                color: Theme.text-primary;
+            }
+        }
+
+        // Safety net: never leave a stale tooltip behind.
+        Timer {
+            interval: 12s;
+            running: root.tip-text != "";
+            triggered => { root.tip-text = ""; }
         }
     }
 }

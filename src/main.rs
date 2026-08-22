@@ -220,7 +220,7 @@ fn scan_music_files(game_root: &Path) -> HashMap<u32, (PathBuf, u64)> {
         .filter_map(|wt| {
             let path = music_dir.join(wt.category).join(wt.mp3_filename);
             let meta = fs::metadata(&path).ok()?;
-            meta.is_file().then(|| (wt.wwise_id, (path, meta.len())))
+            meta.is_file().then_some((wt.wwise_id, (path, meta.len())))
         })
         .collect()
 }
@@ -423,16 +423,23 @@ fn group_by_source(queued: &[QueuedWem]) -> Vec<(PathBuf, Vec<QueuedWem>)> {
 /// Ids that name a sound in callbacks and replacements: a sound-index event
 /// index, or a dialogue voice index tagged with `VOICE_ID`.
 const VOICE_ID: u32 = 0x4000_0000;
+/// Set together with `VOICE_ID`: a speaker group row of the Dialogue tab.
+const SPEAKER_ID: u32 = 0x2000_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SoundId {
     Event(u32),
     Voice(u32),
+    Speaker(u32),
 }
 
 fn parse_id(id: u32) -> SoundId {
     if id & VOICE_ID != 0 {
-        SoundId::Voice(id & !VOICE_ID)
+        if id & SPEAKER_ID != 0 {
+            SoundId::Speaker(id & !(VOICE_ID | SPEAKER_ID))
+        } else {
+            SoundId::Voice(id & !VOICE_ID)
+        }
     } else {
         SoundId::Event(id)
     }
@@ -446,6 +453,7 @@ fn sound_id(raw: i32) -> Option<SoundId> {
     match parse_id(raw as u32) {
         SoundId::Event(e) if (e as usize) < SfxIndex::get().events().len() => Some(SoundId::Event(e)),
         SoundId::Voice(v) if (v as usize) < VoiceIndex::get().len() => Some(SoundId::Voice(v)),
+        SoundId::Speaker(sp) if (sp as usize) < VoiceIndex::get().speakers().len() => Some(SoundId::Speaker(sp)),
         _ => None,
     }
 }
@@ -461,6 +469,7 @@ fn event_display_name(index: &SfxIndex, id: u32) -> String {
     match parse_id(id) {
         SoundId::Event(e) => index.event(e).name.to_string(),
         SoundId::Voice(v) => voice_display_name(v),
+        SoundId::Speaker(sp) => VoiceIndex::get().speaker(sp).label.to_string(),
     }
 }
 
@@ -468,7 +477,7 @@ fn event_display_name(index: &SfxIndex, id: u32) -> String {
 fn tab_of_id(index: &SfxIndex, id: u32) -> usize {
     match parse_id(id) {
         SoundId::Event(e) => index.event(e).tab as usize,
-        SoundId::Voice(_) => index.tab_index(TabKind::Dialogue).unwrap_or(0),
+        SoundId::Voice(_) | SoundId::Speaker(_) => index.tab_index(TabKind::Dialogue).unwrap_or(0),
     }
 }
 
@@ -477,6 +486,7 @@ fn group_of_id(index: &SfxIndex, id: u32) -> String {
     match parse_id(id) {
         SoundId::Event(e) => index.group(index.event(e)).name.to_string(),
         SoundId::Voice(v) => VoiceIndex::get().speaker_label(v),
+        SoundId::Speaker(sp) => VoiceIndex::get().speaker(sp).kind.label().to_string(),
     }
 }
 
@@ -917,10 +927,26 @@ fn find_main_pak(game_root: &Path) -> Option<PathBuf> {
         .max_by_key(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0))
 }
 
+/// The preview pak index shared with the background loader started by
+/// [`prefetch_preview_pak`]; a fresh slot is created whenever the game folder changes.
+type PreviewSlot = Arc<Mutex<Option<PreviewPak>>>;
+
+/// Read the game's pak index on a worker thread so the first Play does not stall
+/// the window. The slot stays locked while loading, so a Play that comes earlier
+/// simply waits for it instead of reading the index a second time.
+fn prefetch_preview_pak(game_root: PathBuf, slot: PreviewSlot) {
+    std::thread::spawn(move || {
+        let mut pak = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if pak.is_none() {
+            *pak = load_preview_pak(&game_root).ok();
+        }
+    });
+}
+
 fn load_preview_pak(game_root: &Path) -> Result<PreviewPak> {
     let path = find_main_pak(game_root).context("no main .pak found in the game's Paks folder")?;
     let index = pak::PakIndex::read(&path, |rel| {
-        rel.strip_prefix("Media/").map_or(false, |r| {
+        rel.strip_prefix("Media/").is_some_and(|r| {
             let r = r.strip_prefix("English(US)/").unwrap_or(r);
             r.ends_with(".wem") && !r.contains('/')
         })
@@ -995,7 +1021,7 @@ struct AppState {
     /// Loose mp3 previews for the music tracks, by wem id.
     music_files: HashMap<u32, (PathBuf, u64)>,
     /// Index of the game's main pak, opened on the first sound-effect preview.
-    preview_pak: Option<PreviewPak>,
+    preview_pak: PreviewSlot,
     replacements: Replacements,
     audio: Option<AudioPlayer>,
 }
@@ -1047,20 +1073,20 @@ fn entry_for_event(index: &SfxIndex, st: &AppState, event: u32, expanded: bool) 
         shared = shared.max(index.events_sharing(wi).len().saturating_sub(1));
         if let Some(r) = st.replacements.get(&wem.id) {
             replaced += 1;
-            if replacement.map_or(true, |cur| cur.via != event && r.via == event) {
+            if replacement.is_none_or(|cur| cur.via != event && r.via == event) {
                 replacement = Some(r);
             }
         }
     }
 
     let status = if ev.plugin() {
-        "plugin"
+        "Plugin"
     } else if replaced == 0 {
-        "vanilla"
+        "Original"
     } else if replaced == total {
-        "replace"
+        "Edited"
     } else {
-        "partial"
+        "Partial"
     };
     let replacement_label = replacement
         .map(|r| {
@@ -1124,7 +1150,9 @@ fn length_label(min_ms: u32, max_ms: u32) -> String {
 }
 
 /// Builds the row for a dialogue voice file.
-fn entry_for_voice(st: &AppState, voice: u32) -> TrackEntry {
+/// Row for one voice line. `kind` 1 = a line under an expanded speaker (the
+/// topic goes in the group column), 0 = a stand-alone row.
+fn entry_for_voice(st: &AppState, voice: u32, kind: i32) -> TrackEntry {
     let vi = VoiceIndex::get();
     let v = vi.voice(voice);
     let line = vi.line_of(v);
@@ -1137,23 +1165,92 @@ fn entry_for_voice(st: &AppState, voice: u32) -> TrackEntry {
     } else {
         line.text.to_string()
     };
-    let detail = if line.topic.is_empty() { v.voice_type() } else { format!("{} \u{00b7} {}", line.topic, v.voice_type()) };
+    let topic = if line.topic.is_empty() { "dialogue".to_string() } else { line.topic.to_string() };
+    let sex = |female: bool| if female { "female" } else { "male" };
+    // The other race folders the game plays this very recording for.
+    let mine = format!("{} {}", v.race, sex(v.female));
+    let mut also: Vec<String> = vi
+        .voices_of_wem(v.wem_id)
+        .iter()
+        .filter(|&&o| o != voice)
+        .map(|&o| {
+            let ov = vi.voice(o);
+            format!("{} {}", ov.race, sex(ov.female))
+        })
+        .filter(|l| *l != mine)
+        .collect();
+    also.sort();
+    also.dedup();
+    let mut detail = if kind == 1 { mine.clone() } else { format!("{} \u{00b7} {}", topic, mine) };
+    if v.voice_race != v.race {
+        detail.push_str(&format!(" ({} actor)", v.voice_race));
+    }
+    if v.alt {
+        detail.push_str(" (alt voice)");
+    }
+    if !also.is_empty() {
+        detail.push_str(&format!(" \u{00b7} same recording as {}", also.join(", ")));
+    }
+    if !line.plugin.is_empty() && line.plugin != "Oblivion" {
+        detail.push_str(&format!(" \u{00b7} {}", line.plugin));
+    }
     TrackEntry {
         event: (VOICE_ID | voice) as i32,
-        kind: 0,
-        variation: 0,
+        kind,
+        variation: if kind == 1 { 1 } else { 0 },
         expanded: false,
         length: wem_info::format_duration_ms(v.duration_ms).into(),
-        group: vi.speaker_label(voice).into(),
+        group: if kind == 1 { topic.into() } else { vi.speaker_label(voice).into() },
         name: text.into(),
         detail: detail.into(),
         size: String::new().into(),
-        status: if replacement.is_some() { "replace" } else { "vanilla" }.into(),
+        status: if replacement.is_some() { "Edited" } else { "Original" }.into(),
         replacement: replacement_label.into(),
         variations: 1,
-        shared: 0,
+        shared: also.len() as i32,
         warning: false,
         can_play: st.game_root.is_some() || replacement.is_some(),
+    }
+}
+
+/// `m:ss` / `h:mm:ss` for the total length of a speaker's lines.
+fn format_total_ms(ms: u64) -> String {
+    let s = ms / 1000;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// Row for a speaker group of the Dialogue tab; `hits` are its lines matching the search.
+fn entry_for_speaker(st: &AppState, speaker: u32, hits: &[u32], expanded: bool) -> TrackEntry {
+    let vi = VoiceIndex::get();
+    let sp = vi.speaker(speaker);
+    let replaced = hits.iter().filter(|&&v| st.replacements.contains_key(&vi.voice(v).wem_id)).count();
+    let total_ms: u64 = hits.iter().map(|&v| vi.voice(v).duration_ms as u64).sum();
+    let n = hits.len();
+    let detail = if n < sp.voices.len() {
+        format!("{} of {} lines match", n, sp.voices.len())
+    } else {
+        format!("{} line{}", n, if n == 1 { "" } else { "s" })
+    };
+    TrackEntry {
+        event: (VOICE_ID | SPEAKER_ID | speaker) as i32,
+        kind: 0,
+        variation: 0,
+        expanded,
+        length: format_total_ms(total_ms).into(),
+        group: sp.kind.label().into(),
+        name: sp.label.into(),
+        detail: detail.into(),
+        size: if replaced > 0 { format!("{replaced} edited") } else { String::new() }.into(),
+        status: "speaker".into(),
+        replacement: String::new().into(),
+        variations: n as i32,
+        shared: 0,
+        warning: false,
+        can_play: false,
     }
 }
 
@@ -1162,7 +1259,7 @@ fn entry_for_variation(index: &SfxIndex, st: &AppState, event: u32, variation: u
     let ev = index.event(event);
     let (wi, wem): (u32, &Wem) = index.media_of(ev).nth(variation).unwrap_or_else(|| index.media_of(ev).next().expect("event without media"));
     let replacement = st.replacements.get(&wem.id);
-    let status = if wem.plugin { "plugin" } else if replacement.is_some() { "replace" } else { "vanilla" };
+    let status = if wem.plugin { "Plugin" } else if replacement.is_some() { "Edited" } else { "Original" };
     let replacement_label = replacement
         .map(|r| {
             let file = r.source.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -1191,19 +1288,25 @@ fn entry_for_variation(index: &SfxIndex, st: &AppState, event: u32, variation: u
 /// Sounds shown per page of a tab.
 const PAGE_SIZE: usize = 50;
 
-/// Row references are packed into a `u32`: plain event index for sound rows,
-/// `ROW_VARIATION | event << 16 | variation` for the rows of an expanded sound.
+/// Row references are packed into a `u32`: plain sound id for sound/speaker rows,
+/// `ROW_VARIATION | event << 16 | variation` for the rows of an expanded sound,
+/// `ROW_VARIATION | VOICE_ID | voice` for the lines of an expanded speaker.
 const ROW_VARIATION: u32 = 0x8000_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowRef {
     Event(u32),
     Variation { event: u32, index: usize },
+    VoiceLine(u32),
 }
 
 fn row_ref(row: u32) -> RowRef {
     if row & ROW_VARIATION != 0 {
-        RowRef::Variation { event: (row >> 16) & 0x7fff, index: (row & 0xffff) as usize }
+        if row & VOICE_ID != 0 {
+            RowRef::VoiceLine(row & !(ROW_VARIATION | VOICE_ID))
+        } else {
+            RowRef::Variation { event: (row >> 16) & 0x3fff, index: (row & 0xffff) as usize }
+        }
     } else {
         RowRef::Event(row)
     }
@@ -1213,10 +1316,15 @@ fn variation_row(event: u32, index: usize) -> u32 {
     ROW_VARIATION | (event << 16) | (index as u32 & 0xffff)
 }
 
+fn voice_line_row(voice: u32) -> u32 {
+    ROW_VARIATION | VOICE_ID | voice
+}
+
 impl RowRef {
     fn event(self) -> u32 {
         match self {
             RowRef::Event(e) | RowRef::Variation { event: e, .. } => e,
+            RowRef::VoiceLine(v) => VOICE_ID | v,
         }
     }
 }
@@ -1227,6 +1335,9 @@ struct InventoryModel {
     filtered: RefCell<Vec<u32>>,
     /// Rows of the current page (events plus the variations of expanded ones).
     rows: RefCell<Vec<u32>>,
+    /// Dialogue tab: the matching lines of each speaker in `filtered` (same order).
+    voice_hits: RefCell<Vec<Vec<u32>>>,
+    lines_total: Cell<usize>,
     page: Cell<usize>,
     tab: Cell<usize>,
     expanded: RefCell<HashSet<u32>>,
@@ -1239,6 +1350,8 @@ impl InventoryModel {
             shared,
             filtered: RefCell::new(Vec::new()),
             rows: RefCell::new(Vec::new()),
+            voice_hits: RefCell::new(Vec::new()),
+            lines_total: Cell::new(0),
             page: Cell::new(0),
             tab: Cell::new(0),
             expanded: RefCell::new(HashSet::new()),
@@ -1250,11 +1363,17 @@ impl InventoryModel {
     fn set_view(&self, tab: usize, query: &str) {
         let index = SfxIndex::get();
         let tab = tab.min(index.tabs().len().saturating_sub(1));
+        let mut voice_hits: Vec<Vec<u32>> = Vec::new();
         let mut filtered = if index.tabs()[tab].kind == TabKind::Dialogue {
-            VoiceIndex::get().search(query).into_iter().map(|v| VOICE_ID | v).collect()
+            let groups = VoiceIndex::get().search_speakers(query);
+            let ids = groups.iter().map(|(sp, _)| VOICE_ID | SPEAKER_ID | sp).collect();
+            voice_hits = groups.into_iter().map(|(_, v)| v).collect();
+            ids
         } else {
             index.search(tab, query)
         };
+        self.lines_total.set(voice_hits.iter().map(Vec::len).sum());
+        *self.voice_hits.borrow_mut() = voice_hits;
         if index.tabs()[tab].kind == TabKind::Music {
             filtered.sort_by_key(|&e| {
                 index.media_of(index.event(e)).next().map(|(_, w)| music_position(w.id)).unwrap_or(usize::MAX)
@@ -1273,12 +1392,17 @@ impl InventoryModel {
         self.filtered.borrow().len()
     }
 
+    /// Dialogue tab: lines matching the search across all listed speakers.
+    fn lines_total(&self) -> usize {
+        self.lines_total.get()
+    }
+
     fn page(&self) -> usize {
         self.page.get()
     }
 
     fn page_count(&self) -> usize {
-        (self.filtered_len() + PAGE_SIZE - 1) / PAGE_SIZE
+        self.filtered_len().div_ceil(PAGE_SIZE)
     }
 
     /// 1-based `(first, last)` sound numbers shown on the current page.
@@ -1318,21 +1442,32 @@ impl InventoryModel {
         let index = SfxIndex::get();
         let filtered = self.filtered.borrow();
         let expanded = self.expanded.borrow();
+        let voice_hits = self.voice_hits.borrow();
         let start = (self.page.get() * PAGE_SIZE).min(filtered.len());
         let end = (start + PAGE_SIZE).min(filtered.len());
         let mut rows = Vec::with_capacity(end - start + 8);
-        for &ev in &filtered[start..end] {
+        for (pos, &ev) in filtered[start..end].iter().enumerate() {
             rows.push(ev);
-            if let SoundId::Event(e) = parse_id(ev) {
-                if expanded.contains(&ev) {
+            if !expanded.contains(&ev) {
+                continue;
+            }
+            match parse_id(ev) {
+                SoundId::Event(e) => {
                     for i in 0..index.event(e).media_count() {
                         rows.push(variation_row(e, i));
                     }
                 }
+                SoundId::Speaker(_) => {
+                    if let Some(hits) = voice_hits.get(start + pos) {
+                        rows.extend(hits.iter().map(|&v| voice_line_row(v)));
+                    }
+                }
+                SoundId::Voice(_) => {}
             }
         }
         drop(filtered);
         drop(expanded);
+        drop(voice_hits);
         *self.rows.borrow_mut() = rows;
         self.notify.reset();
     }
@@ -1344,9 +1479,13 @@ impl InventoryModel {
 
     /// Re-fetch the rows (sound and variation rows) of the given events, if visible.
     fn invalidate_events(&self, events: &[u32]) {
+        // A changed voice line also changes the counts on every speaker row.
+        let voice_changed = events.iter().any(|&e| e & VOICE_ID != 0);
         let rows = self.rows.borrow();
         for (pos, &row) in rows.iter().enumerate() {
-            if events.contains(&row_ref(row).event()) {
+            let r = row_ref(row);
+            let speaker_row = matches!(r, RowRef::Event(id) if matches!(parse_id(id), SoundId::Speaker(_)));
+            if events.contains(&r.event()) || (voice_changed && speaker_row) {
                 self.notify.row_changed(pos);
             }
         }
@@ -1367,9 +1506,16 @@ impl Model for InventoryModel {
         Some(match row_ref(row) {
             RowRef::Event(ev) => match parse_id(ev) {
                 SoundId::Event(e) => entry_for_event(index, &st, e, self.is_expanded(ev)),
-                SoundId::Voice(v) => entry_for_voice(&st, v),
+                SoundId::Voice(v) => entry_for_voice(&st, v, 0),
+                SoundId::Speaker(sp) => {
+                    let filtered = self.filtered.borrow();
+                    let hits = self.voice_hits.borrow();
+                    let mine = filtered.iter().position(|&x| x == ev).and_then(|p| hits.get(p)).map(Vec::as_slice).unwrap_or(&[]);
+                    entry_for_speaker(&st, sp, mine, self.is_expanded(ev))
+                }
             },
             RowRef::Variation { event, index: i } => entry_for_variation(index, &st, event, i),
+            RowRef::VoiceLine(v) => entry_for_voice(&st, v, 1),
         })
     }
 
@@ -1386,6 +1532,7 @@ impl Model for InventoryModel {
 fn sync_page_props(app: &AppWindow, model: &InventoryModel) {
     let (first, last) = model.page_bounds();
     app.set_tab_total(model.filtered_len() as i32);
+    app.set_tab_lines(model.lines_total() as i32);
     app.set_page_index(model.page() as i32);
     app.set_page_count(model.page_count() as i32);
     app.set_page_first(first as i32);
@@ -1412,7 +1559,7 @@ fn update_counts(app: &AppWindow, shared: &SharedState, tabs: &slint::VecModel<T
     app.set_staged_count(events.len() as i32);
     for (i, tab) in index.tabs().iter().enumerate() {
         let info = tab_info(tab, per_tab[i]);
-        if tabs.row_data(i).map_or(true, |cur| cur.queued != info.queued) {
+        if tabs.row_data(i).is_none_or(|cur| cur.queued != info.queued) {
             tabs.set_row_data(i, info);
         }
     }
@@ -1443,12 +1590,14 @@ fn try_connect_game(app: &AppWindow, shared: &SharedState, path: &str, model: &I
         Some(root) => {
             let music = scan_music_files(&root);
             let previewable = music.len();
+            let preview_slot = PreviewSlot::default();
             {
                 let mut st = state(shared);
                 st.game_root = Some(root.clone());
                 st.music_files = music;
-                st.preview_pak = None;
+                st.preview_pak = preview_slot.clone();
             }
+            prefetch_preview_pak(root.clone(), preview_slot);
             app.set_game_valid(true);
             app.set_game_status("Game folder validated. Music directory found.".into());
             app.set_game_tone(Tone::Success as i32);
@@ -1471,7 +1620,7 @@ fn try_connect_game(app: &AppWindow, shared: &SharedState, path: &str, model: &I
                 let mut st = state(shared);
                 st.game_root = None;
                 st.music_files.clear();
-                st.preview_pak = None;
+                st.preview_pak = PreviewSlot::default();
             }
             app.set_game_valid(false);
             app.set_game_status("Music directory not found at that path.".into());
@@ -1502,9 +1651,10 @@ fn load_preview(shared: &SharedState, id: u32, variation: i32) -> Result<Preview
             let voice = VoiceIndex::get().voice(v);
             (voice.wem_id, true, voice_display_name(v))
         }
+        SoundId::Speaker(_) => bail!("expand the speaker and play one of the lines"),
     };
 
-    let mut st = state(shared);
+    let st = state(shared);
     if let Some(r) = st.replacements.get(&wem_id) {
         let source = r.source.clone();
         drop(st);
@@ -1520,11 +1670,14 @@ fn load_preview(shared: &SharedState, id: u32, variation: i32) -> Result<Preview
     let Some(root) = st.game_root.clone() else {
         bail!("connect the game folder first to preview sound effects");
     };
-    if st.preview_pak.is_none() {
-        st.preview_pak = Some(load_preview_pak(&root)?);
-    }
-    let bytes = st.preview_pak.as_ref().unwrap().extract(wem_id, localised)?;
+    let slot = st.preview_pak.clone();
     drop(st);
+    let mut pak = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if pak.is_none() {
+        *pak = Some(load_preview_pak(&root)?);
+    }
+    let bytes = pak.as_ref().unwrap().extract(wem_id, localised)?;
+    drop(pak);
     preview_from_wem_bytes(&bytes, label)
 }
 
@@ -1609,10 +1762,30 @@ fn replace_voice(app: &AppWindow, shared: &SharedState, model: &InventoryModel, 
     let Some(source) = dialog.pick_file() else { return };
     let fname = source.file_name().unwrap_or_default().to_string_lossy().to_string();
     state(shared).replacements.insert(v.wem_id, Replacement { source, via: id });
-    model.invalidate_events(&[id]);
+    let ids: Vec<u32> = vi.voices_of_wem(v.wem_id).iter().map(|&o| VOICE_ID | o).collect();
+    model.invalidate_events(&ids);
     update_counts(app, shared, tabs);
     append_log(app, &format!("Queued: {} <- {}", name, fname));
-    set_status(app, "Ready", &format!("{} queued for replacement.", name), Tone::Success);
+    let others = ids.len().saturating_sub(1);
+    if others > 0 {
+        append_log(app, &format!("  note: this recording is also used for {} other voice line{}; they change too", others, if others == 1 { "" } else { "s" }));
+        set_status(app, "Queued with a note", &format!("{} queued; the recording is shared with {} other line(s).", name, others), Tone::Warning);
+    } else {
+        set_status(app, "Ready", &format!("{} queued for replacement.", name), Tone::Success);
+    }
+}
+
+/// Clear the replacement of one dialogue voice file.
+fn remove_voice(app: &AppWindow, shared: &SharedState, model: &InventoryModel, tabs: &slint::VecModel<TabInfo>, voice: u32) {
+    let vi = VoiceIndex::get();
+    let v = vi.voice(voice);
+    let name = voice_display_name(voice);
+    state(shared).replacements.remove(&v.wem_id);
+    let ids: Vec<u32> = vi.voices_of_wem(v.wem_id).iter().map(|&o| VOICE_ID | o).collect();
+    model.invalidate_events(&ids);
+    update_counts(app, shared, tabs);
+    append_log(app, &format!("Removed: {}", name));
+    set_status(app, "Ready", &format!("{} replacement cleared.", name), Tone::Neutral);
 }
 
 // ---------------------------------------------------------------------------
@@ -1623,10 +1796,11 @@ fn main() -> Result<(), slint::PlatformError> {
     let app = AppWindow::new()?;
     app.set_application_version(VERSION.into());
 
+    #[allow(clippy::arc_with_non_send_sync)] // the audio handle is not Send; the mutex only serialises UI callbacks
     let shared: SharedState = Arc::new(Mutex::new(AppState {
         game_root: None,
         music_files: HashMap::new(),
-        preview_pak: None,
+        preview_pak: PreviewSlot::default(),
         replacements: BTreeMap::new(),
         audio: None,
     }));
@@ -1659,7 +1833,13 @@ fn main() -> Result<(), slint::PlatformError> {
     sync_page_props(&app, &model);
     append_log(
         &app,
-        &format!("Sound index: {} sounds in {} tabs, {} dialogue lines.", index.events().len(), index.tabs().iter().filter(|t| t.kind.available()).count(), VoiceIndex::get().len()),
+        &format!(
+            "Sound index: {} sounds in {} tabs; {} voice lines for {} speakers.",
+            index.events().len(),
+            index.tabs().iter().filter(|t| t.kind.available()).count(),
+            VoiceIndex::get().len(),
+            VoiceIndex::get().speakers().len()
+        ),
     );
 
     if let Some(root) = find_game_install() {
@@ -1748,7 +1928,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     replace_voice(&app, &shared, &model, &tabs, v);
                     return;
                 }
-                None => return,
+                None | Some(SoundId::Speaker(_)) => return,
             };
             let ev = index.event(event);
             let name = event_display_name(index, event);
@@ -1823,16 +2003,10 @@ fn main() -> Result<(), slint::PlatformError> {
             let event = match sound_id(event) {
                 Some(SoundId::Event(e)) => e,
                 Some(SoundId::Voice(v)) => {
-                    let voice = VoiceIndex::get().voice(v);
-                    let name = voice_display_name(v);
-                    state(&shared).replacements.remove(&voice.wem_id);
-                    model.invalidate_events(&[VOICE_ID | v]);
-                    update_counts(&app, &shared, &tabs);
-                    append_log(&app, &format!("Removed: {}", name));
-                    set_status(&app, "Ready", &format!("{} replacement cleared.", name), Tone::Neutral);
+                    remove_voice(&app, &shared, &model, &tabs, v);
                     return;
                 }
-                None => return,
+                None | Some(SoundId::Speaker(_)) => return,
             };
             let ev = index.event(event);
             let name = event_display_name(index, event);
@@ -1884,7 +2058,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let model = model.clone();
         app.on_toggle_expand(move |event| {
-            if !matches!(sound_id(event), Some(SoundId::Event(_))) {
+            if !matches!(sound_id(event), Some(SoundId::Event(_) | SoundId::Speaker(_))) {
                 return;
             }
             // Defer past the current click sequence so the rows that appear never land
@@ -1901,6 +2075,10 @@ fn main() -> Result<(), slint::PlatformError> {
         let tabs = tabs_model.clone();
         app.on_replace_variation(move |event, variation| {
             let Some(app) = weak.upgrade() else { return };
+            if let Some(SoundId::Voice(v)) = sound_id(event) {
+                replace_voice(&app, &shared, &model, &tabs, v);
+                return;
+            }
             let index = SfxIndex::get();
             if event < 0 || event as usize >= index.events().len() || variation < 1 {
                 return;
@@ -1943,6 +2121,10 @@ fn main() -> Result<(), slint::PlatformError> {
         let tabs = tabs_model.clone();
         app.on_remove_variation(move |event, variation| {
             let Some(app) = weak.upgrade() else { return };
+            if let Some(SoundId::Voice(v)) = sound_id(event) {
+                remove_voice(&app, &shared, &model, &tabs, v);
+                return;
+            }
             let index = SfxIndex::get();
             if event < 0 || event as usize >= index.events().len() || variation < 1 {
                 return;
@@ -2065,7 +2247,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let shared = shared.clone();
         app.on_seek_to(move |fraction| {
-            let fraction = fraction.max(0.0).min(1.0);
+            let fraction = fraction.clamp(0.0, 1.0);
             let st = state(&shared);
             if let Some(audio) = &st.audio {
                 let target = Duration::from_secs_f32(
@@ -2528,12 +2710,12 @@ mod tests {
     #[test]
     fn entry_reflects_replacements_shared_wems_and_music_previews() {
         let index = SfxIndex::get();
-        let mut st = AppState { game_root: None, music_files: HashMap::new(), preview_pak: None, replacements: Replacements::new(), audio: None };
+        let mut st = AppState { game_root: None, music_files: HashMap::new(), preview_pak: PreviewSlot::default(), replacements: Replacements::new(), audio: None };
 
         // Music row: name/category from the table, "packed" without a preview file.
         let battle = event_named("Battle 01");
         let row = entry_for_event(index, &st, battle, false);
-        assert_eq!((row.group.as_str(), row.name.as_str(), row.size.as_str(), row.status.as_str()), ("Battle", "Battle 01", "packed", "vanilla"));
+        assert_eq!((row.group.as_str(), row.name.as_str(), row.size.as_str(), row.status.as_str()), ("Battle", "Battle 01", "packed", "Original"));
         assert!(!row.can_play);
         st.music_files.insert(WWISE_TRACKS[0].wwise_id, (PathBuf::from(r"C:\g\battle_01.mp3"), 2_000_000));
         let row = entry_for_event(index, &st, battle, false);
@@ -2546,11 +2728,11 @@ mod tests {
         let (a, b) = (sharers[0], sharers[1]);
         replace_event(&mut st.replacements, a, r"C:\sfx\click.wav");
         let row_a = entry_for_event(index, &st, a, false);
-        assert_eq!(row_a.status.as_str(), "replace");
+        assert_eq!(row_a.status.as_str(), "Edited");
         assert_eq!(row_a.replacement.as_str(), "click.wav");
         assert!(row_a.shared >= 1);
         let row_b = entry_for_event(index, &st, b, false);
-        assert!(row_b.status.as_str() == "partial" || row_b.status.as_str() == "replace", "{}", row_b.status);
+        assert!(row_b.status.as_str() == "Partial" || row_b.status.as_str() == "Edited", "{}", row_b.status);
         assert!(row_b.replacement.contains("(via "), "{}", row_b.replacement);
         assert!(affected_events(index, a).contains(&b));
 
@@ -2566,35 +2748,53 @@ mod tests {
         // Variation rows carry the wav name and the wem id, and replace individually.
         let multi = index.events().iter().position(|e| e.media_count() >= 3).unwrap() as u32;
         let v2 = entry_for_variation(index, &st, multi, 1);
-        assert_eq!((v2.kind, v2.variation, v2.status.as_str()), (1, 2, "vanilla"));
+        assert_eq!((v2.kind, v2.variation, v2.status.as_str()), (1, 2, "Original"));
         assert!(v2.detail.starts_with("id "));
         let (_, wem2) = index.media_of(index.event(multi)).nth(1).unwrap();
         st.replacements.insert(wem2.id, Replacement { source: PathBuf::from(r"C:\sfx\one.wav"), via: multi });
-        assert_eq!(entry_for_variation(index, &st, multi, 1).status.as_str(), "replace");
-        assert_eq!(entry_for_variation(index, &st, multi, 0).status.as_str(), "vanilla");
-        assert_eq!(entry_for_event(index, &st, multi, false).status.as_str(), "partial");
+        assert_eq!(entry_for_variation(index, &st, multi, 1).status.as_str(), "Edited");
+        assert_eq!(entry_for_variation(index, &st, multi, 0).status.as_str(), "Original");
+        assert_eq!(entry_for_event(index, &st, multi, false).status.as_str(), "Partial");
     }
 
     #[test]
     fn dialogue_rows_replace_and_round_trip() {
         let index = SfxIndex::get();
         let vi = VoiceIndex::get();
-        let shared: SharedState = Arc::new(Mutex::new(AppState { game_root: None, music_files: HashMap::new(), preview_pak: None, replacements: Replacements::new(), audio: None }));
+        let shared: SharedState = Arc::new(Mutex::new(AppState { game_root: None, music_files: HashMap::new(), preview_pak: PreviewSlot::default(), replacements: Replacements::new(), audio: None }));
         let model = InventoryModel::new(shared.clone());
         let dialogue = index.tab_index(TabKind::Dialogue).unwrap();
         model.set_view(dialogue, "sheogorath");
-        assert!(model.filtered_len() > 0);
-        let row = model.row_data(0).unwrap();
-        assert_eq!(row.kind, 0);
+        assert!(model.filtered_len() > 1);
+        assert!(model.lines_total() > model.filtered_len());
+        // Speaker rows: the speaker whose name matches comes first and expands into its lines.
+        let speaker = model.row_data(0).unwrap();
+        assert_eq!((speaker.kind, speaker.status.as_str(), speaker.name.as_str()), (0, "speaker", "Sheogorath"));
+        assert_eq!(speaker.group.as_str(), "NPC");
+        assert!(speaker.variations > 100, "{}", speaker.variations);
+        assert!(!speaker.can_play && speaker.replacement.is_empty() && speaker.size.is_empty());
+        let sid = speaker.event as u32;
+        assert!(matches!(sound_id(speaker.event), Some(SoundId::Speaker(_))));
+        assert_eq!(tab_of_id(index, sid), dialogue);
+        let page_rows = model.row_count();
+        model.toggle_expand(sid);
+        assert_eq!(model.row_count(), page_rows + speaker.variations as usize);
+        assert!(model.row_data(0).unwrap().expanded);
+        let row = model.row_data(1).unwrap();
+        assert_eq!((row.kind, row.variation), (1, 1));
         let id = row.event as u32;
         let SoundId::Voice(v) = parse_id(id) else { panic!("not a voice id") };
         assert_eq!(sound_id(row.event), Some(SoundId::Voice(v)));
-        assert!(!row.group.is_empty() && !row.name.is_empty());
+        assert!(!row.group.is_empty() && !row.name.is_empty() && !row.detail.is_empty());
+        assert!(vi.speakers_of_voice(v).iter().any(|&sp| vi.speaker(sp).label == "Sheogorath"));
 
-        // Replacing a voice file is keyed by its (localised) wem.
+        // Replacing a voice file is keyed by its (localised) wem; the speaker row counts it.
         let wem = vi.voice(v).wem_id;
         state(&shared).replacements.insert(wem, Replacement { source: PathBuf::from(r"C:\voice\line.wav"), via: id });
-        assert_eq!(model.row_data(0).unwrap().status.as_str(), "replace");
+        assert_eq!(model.row_data(1).unwrap().status.as_str(), "Edited");
+        assert_eq!(model.row_data(0).unwrap().size.as_str(), "1 edited");
+        assert_eq!(format_total_ms(3_725_000), "1:02:05");
+        assert_eq!(format_total_ms(65_000), "1:05");
         let queued = queued_from(&state(&shared).replacements);
         assert_eq!(queued.len(), 1);
         assert!(queued[0].localised);
@@ -2610,7 +2810,7 @@ mod tests {
 
     #[test]
     fn inventory_model_pages_and_expands() {
-        let shared: SharedState = Arc::new(Mutex::new(AppState { game_root: None, music_files: HashMap::new(), preview_pak: None, replacements: Replacements::new(), audio: None }));
+        let shared: SharedState = Arc::new(Mutex::new(AppState { game_root: None, music_files: HashMap::new(), preview_pak: PreviewSlot::default(), replacements: Replacements::new(), audio: None }));
         let index = SfxIndex::get();
         let model = InventoryModel::new(shared);
         let creatures = index.tab_index(TabKind::Creatures).unwrap();

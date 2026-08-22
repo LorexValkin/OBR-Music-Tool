@@ -53,6 +53,7 @@ impl TabKind {
         }
     }
 
+    #[cfg(test)]
     pub fn from_label(label: &str) -> Option<TabKind> {
         TabKind::ALL.iter().copied().find(|t| t.label() == label)
     }
@@ -159,7 +160,7 @@ const KEEP_UPPER: &[&str] = &["HUD", "OS", "UI", "NPC", "VFX", "SFX"];
 /// `Flame_Atronach` → `Flame Atronach`, `EmperorDeath` → `Emperor Death`, `HUD` stays `HUD`.
 pub fn humanise(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
-    for (i, word) in s.split(|c| c == '_' || c == ' ').filter(|w| !w.is_empty()).enumerate() {
+    for (i, word) in s.split(['_', ' ']).filter(|w| !w.is_empty()).enumerate() {
         if i > 0 {
             out.push(' ');
         }
@@ -202,7 +203,7 @@ const NOISE_DIRS: &[&str] = &[
 fn meaningful_dirs(rel_path: &str) -> Vec<&str> {
     let mut comps: Vec<&str> = rel_path.split('/').collect();
     comps.pop(); // event name
-    if comps.first().map_or(false, |c| c.eq_ignore_ascii_case("Events")) {
+    if comps.first().is_some_and(|c| c.eq_ignore_ascii_case("Events")) {
         comps.remove(0);
     }
     if !comps.is_empty() {

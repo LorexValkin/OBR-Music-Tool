@@ -178,7 +178,7 @@ pub fn build(mut events: Vec<RawEvent>, utoc_fingerprint: u64, utoc_entry_count:
                         flags |= EV_HAS_UNPAIRED;
                     }
                 }
-                let suspect = ev.bank_size.map_or(false, |b| {
+                let suspect = ev.bank_size.is_some_and(|b| {
                     b > PREFETCH_BANK_BYTES && b / (ev.media.len().max(1) as u64) > PREFETCH_BYTES_PER_MEDIA
                 });
                 if suspect && *tab != TabKind::Music {

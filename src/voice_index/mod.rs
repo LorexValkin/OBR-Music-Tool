@@ -9,6 +9,7 @@
 pub mod format;
 
 use format::{RawVoiceIndex, LINE_NAMED_SPEAKER, NONE, VOICE_ALT};
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::OnceLock;
 
@@ -38,6 +39,9 @@ pub struct Voice {
     pub female: bool,
     /// Race of the actor who recorded the file (can differ from `race`).
     pub voice_race: &'static str,
+    /// Indices into the index's race table (lower-case copies for search).
+    race_id: u8,
+    voice_race_id: u8,
     pub alt: bool,
     pub duration_ms: u32,
 }
@@ -53,12 +57,52 @@ impl Voice {
     }
 }
 
+/// How a speaker group was derived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SpeakerKind {
+    /// A named NPC from the line's conditions.
+    Npc,
+    /// Lines for members of a faction.
+    Faction,
+    /// Lines for NPCs of a class.
+    Class,
+    /// Lines any NPC of a race and sex can say.
+    Race,
+}
+
+impl SpeakerKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            SpeakerKind::Npc => "NPC",
+            SpeakerKind::Faction => "Faction",
+            SpeakerKind::Class => "Class",
+            SpeakerKind::Race => "Race",
+        }
+    }
+}
+
+/// A speaker group of the Dialogue tab: every voice line said by one NPC
+/// (or by a faction, class, or race+sex), in display order.
+pub struct Speaker {
+    pub label: &'static str,
+    pub kind: SpeakerKind,
+    pub voices: Vec<u32>,
+}
+
 pub struct VoiceIndex {
     lines: Vec<Line>,
     voices: Vec<Voice>,
+    /// Voice indices sorted by wem id (a shared recording appears once per voice).
     by_wem: Vec<u32>,
     /// Lower-case searchable text per line: speaker, topic, quest, text, plugin.
     haystack: Vec<String>,
+    /// Lower-case race labels, indexed like the race table.
+    races_lc: Vec<String>,
+    /// NPCs first (alphabetical), then factions, classes and race groups.
+    speakers: Vec<Speaker>,
+    /// Speaker ids of voice `i` are `voice_speaker_ids[offsets[i]..offsets[i + 1]]`.
+    voice_speaker_offsets: Vec<u32>,
+    voice_speaker_ids: Vec<u32>,
 }
 
 impl VoiceIndex {
@@ -101,6 +145,8 @@ impl VoiceIndex {
                     race: races[v.race as usize],
                     female: v.sex == 1,
                     voice_race: races[v.voice_race as usize],
+                    race_id: v.race,
+                    voice_race_id: v.voice_race,
                     alt: v.flags & VOICE_ALT != 0,
                     duration_ms: v.duration_ms,
                 }
@@ -111,7 +157,44 @@ impl VoiceIndex {
             .iter()
             .map(|l| format!("{}|{}|{}|{}|{}", l.speaker, l.topic, l.quest, l.text, l.plugin).to_lowercase())
             .collect();
-        Ok(VoiceIndex { lines, voices, by_wem, haystack })
+        let races_lc: Vec<String> = races.iter().map(|r| r.to_lowercase()).collect();
+
+        // Speaker groups: one per NPC named in the line's conditions, else the
+        // faction/class hint, else "Any <race> <sex>".
+        let mut race_labels: HashMap<(&'static str, bool), &'static str> = HashMap::new();
+        let mut groups: HashMap<(SpeakerKind, &'static str), Vec<u32>> = HashMap::new();
+        let mut per_voice: Vec<Vec<(SpeakerKind, &'static str)>> = Vec::with_capacity(voices.len());
+        for (i, v) in voices.iter().enumerate() {
+            let l = &lines[v.line as usize];
+            let mut labels: Vec<(SpeakerKind, &'static str)> = Vec::with_capacity(1);
+            if l.named_speaker && !l.speaker.is_empty() {
+                labels.extend(l.speaker.split(", ").filter(|n| !n.is_empty()).map(|n| (SpeakerKind::Npc, n)));
+            } else if let Some(f) = l.speaker.strip_suffix(" members") {
+                labels.push((SpeakerKind::Faction, f));
+            } else if !l.speaker.is_empty() {
+                labels.push((SpeakerKind::Class, l.speaker));
+            } else {
+                let label = *race_labels
+                    .entry((v.race, v.female))
+                    .or_insert_with(|| Box::leak(format!("Any {} {}", v.race, if v.female { "female" } else { "male" }).into_boxed_str()));
+                labels.push((SpeakerKind::Race, label));
+            }
+            for lab in &labels {
+                groups.entry(*lab).or_default().push(i as u32);
+            }
+            per_voice.push(labels);
+        }
+        let mut speakers: Vec<Speaker> = groups.into_iter().map(|((kind, label), voices)| Speaker { label, kind, voices }).collect();
+        speakers.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase())).then_with(|| a.label.cmp(b.label)));
+        let speaker_ids: HashMap<(SpeakerKind, &'static str), u32> = speakers.iter().enumerate().map(|(i, sp)| ((sp.kind, sp.label), i as u32)).collect();
+        let mut voice_speaker_offsets = Vec::with_capacity(voices.len() + 1);
+        let mut voice_speaker_ids = Vec::with_capacity(voices.len());
+        for labels in &per_voice {
+            voice_speaker_offsets.push(voice_speaker_ids.len() as u32);
+            voice_speaker_ids.extend(labels.iter().map(|lab| speaker_ids[lab]));
+        }
+        voice_speaker_offsets.push(voice_speaker_ids.len() as u32);
+        Ok(VoiceIndex { lines, voices, by_wem, haystack, races_lc, speakers, voice_speaker_offsets, voice_speaker_ids })
     }
 
     pub fn len(&self) -> usize {
@@ -134,12 +217,58 @@ impl VoiceIndex {
         &self.lines
     }
 
-    /// Voice index for a wem id (binary search).
+    /// Every voice that plays this recording (the same wem serves several race
+    /// folders), in display order.
+    pub fn voices_of_wem(&self, wem_id: u32) -> &[u32] {
+        let lo = self.by_wem.partition_point(|&i| self.voices[i as usize].wem_id < wem_id);
+        let hi = self.by_wem.partition_point(|&i| self.voices[i as usize].wem_id <= wem_id);
+        &self.by_wem[lo..hi]
+    }
+
+    /// First voice for a wem id.
     pub fn by_wem(&self, wem_id: u32) -> Option<u32> {
-        self.by_wem
-            .binary_search_by_key(&wem_id, |&i| self.voices[i as usize].wem_id)
-            .ok()
-            .map(|pos| self.by_wem[pos])
+        self.voices_of_wem(wem_id).first().copied()
+    }
+
+    pub fn speakers(&self) -> &[Speaker] {
+        &self.speakers
+    }
+
+    pub fn speaker(&self, idx: u32) -> &Speaker {
+        &self.speakers[idx as usize]
+    }
+
+    /// Speaker groups a voice belongs to (a line conditioned on several NPCs is under each).
+    pub fn speakers_of_voice(&self, voice: u32) -> &[u32] {
+        let i = voice as usize;
+        &self.voice_speaker_ids[self.voice_speaker_offsets[i] as usize..self.voice_speaker_offsets[i + 1] as usize]
+    }
+
+    /// The voices matching `query` grouped by speaker: `(speaker, matching voices)`.
+    /// Speakers whose label equals the query come first, then labels containing
+    /// it, then the rest, each in display order.
+    pub fn search_speakers(&self, query: &str) -> Vec<(u32, Vec<u32>)> {
+        let mut groups: Vec<Vec<u32>> = vec![Vec::new(); self.speakers.len()];
+        for v in self.search(query) {
+            for &sp in self.speakers_of_voice(v) {
+                groups[sp as usize].push(v);
+            }
+        }
+        let mut out: Vec<(u32, Vec<u32>)> = groups.into_iter().enumerate().filter(|(_, g)| !g.is_empty()).map(|(sp, g)| (sp as u32, g)).collect();
+        let q = query.trim().to_lowercase();
+        if !q.is_empty() {
+            out.sort_by_key(|(sp, _)| {
+                let label = self.speakers[*sp as usize].label.to_lowercase();
+                if label == q {
+                    0
+                } else if label.contains(&q) {
+                    1
+                } else {
+                    2
+                }
+            });
+        }
+        out
     }
 
     /// Who says it: the named speaker, else `Any <race> <sex>`.
@@ -168,8 +297,8 @@ impl VoiceIndex {
             let hits = &line_hits[v.line as usize];
             let ok = tokens.iter().enumerate().all(|(ti, t)| {
                 hits[ti]
-                    || v.voice_race.to_lowercase().contains(t.as_str())
-                    || v.race.to_lowercase().contains(t.as_str())
+                    || self.races_lc[v.voice_race_id as usize].contains(t.as_str())
+                    || self.races_lc[v.race_id as usize].contains(t.as_str())
                     || (if v.female { "female" } else { "male" }) == t
                     || (v.alt && "alt".starts_with(t.as_str()))
                     || (t.bytes().all(|b| b.is_ascii_digit()) && v.wem_id.to_string().starts_with(t.as_str()))
@@ -196,9 +325,40 @@ mod tests {
         let with_text = idx.lines().iter().filter(|l| !l.text.is_empty()).count();
         assert!(with_text > 19_000, "{with_text} lines with text");
         for (i, v) in idx.voices.iter().enumerate() {
-            assert_eq!(idx.by_wem(v.wem_id), Some(i as u32));
+            assert!(idx.voices_of_wem(v.wem_id).contains(&(i as u32)));
         }
         assert!(idx.voices.iter().filter(|v| v.duration_ms > 0).count() > 90_000);
+        // Recordings are shared between race folders (Dark Elf / Wood Elf / High Elf ...).
+        let shared = idx.voices.iter().filter(|v| idx.voices_of_wem(v.wem_id).len() > 1).count();
+        assert!(shared > 30_000, "{shared} voices share a recording");
+        assert_eq!(idx.by_wem(0), None);
+    }
+
+    #[test]
+    fn speaker_groups_cover_every_voice() {
+        let idx = VoiceIndex::get();
+        assert!(idx.speakers().len() > 1_000, "{}", idx.speakers().len());
+        let total: usize = idx.speakers().iter().map(|s| s.voices.len()).sum();
+        assert!(total >= idx.len());
+        for (i, _) in idx.voices.iter().enumerate() {
+            let sps = idx.speakers_of_voice(i as u32);
+            assert!(!sps.is_empty());
+            assert!(sps.iter().all(|&sp| idx.speaker(sp).voices.contains(&(i as u32))));
+        }
+        // Ordered: NPCs, then factions, classes and race groups.
+        assert!(idx.speakers().windows(2).all(|w| w[0].kind <= w[1].kind));
+        let sheo = idx.speakers().iter().find(|s| s.label == "Sheogorath").expect("Sheogorath");
+        assert_eq!(sheo.kind, SpeakerKind::Npc);
+        assert!(sheo.voices.len() > 100, "{}", sheo.voices.len());
+        assert!(idx.speakers().iter().any(|s| s.kind == SpeakerKind::Race && s.label == "Any Orc female"));
+        assert!(idx.speakers().iter().any(|s| s.kind == SpeakerKind::Faction));
+
+        let groups = idx.search_speakers("sheogorath");
+        assert_eq!(idx.speaker(groups[0].0).label, "Sheogorath");
+        assert!(groups.len() > 1);
+        assert!(groups.iter().all(|(_, v)| !v.is_empty()));
+        let all = idx.search_speakers("");
+        assert_eq!(all.len(), idx.speakers().len());
     }
 
     #[test]

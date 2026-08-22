@@ -106,7 +106,6 @@ fn parse_asset(rel: &str, chunk: u32) -> Option<VoiceAsset> {
 }
 
 pub struct VoiceStats {
-    pub assets: usize,
     pub voices: usize,
     pub lines: usize,
     pub with_text: usize,
@@ -115,6 +114,7 @@ pub struct VoiceStats {
 }
 
 /// Build the dialogue tables. `data_dir` is the game's `Dev/ObvData/Data` folder.
+#[allow(clippy::too_many_arguments)] // one-shot pipeline step; the inputs are the builder's open handles
 pub fn build<R: Read + Seek>(
     utoc: &Utoc,
     ucas: &mut R,
@@ -206,7 +206,7 @@ pub fn build<R: Read + Seek>(
             }
         }
         let mut pairs: Vec<_> = pairs.into_iter().collect();
-        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        pairs.sort_by_key(|p| std::cmp::Reverse(p.1));
         let summary: Vec<String> = pairs.iter().take(12).map(|((r, a), n)| format!("{r} lines voiced by {a} actor: {n}")).collect();
         log(&format!("voice overlap: {}", summary.join("; ")));
     }
@@ -234,7 +234,7 @@ pub fn build<R: Read + Seek>(
     // 5. Join with the plugin records.
     let mut strings: BTreeSet<String> = BTreeSet::new();
     let mut races: Vec<String> = Vec::new();
-    let mut race_id = |name: &str, races: &mut Vec<String>| -> u8 {
+    let race_id = |name: &str, races: &mut Vec<String>| -> u8 {
         let label = race_label(name);
         if let Some(i) = races.iter().position(|r| r == &label) {
             return i as u8;
@@ -250,13 +250,25 @@ pub fn build<R: Read + Seek>(
         speaker: String,
         named: bool,
     }
+    /// One voice event before the line table exists.
+    struct RawVoice {
+        plugin: u8,
+        formid: u32,
+        response: u8,
+        race: u8,
+        sex: u8,
+        voice_race: u8,
+        flags: u8,
+        wem_id: u32,
+        duration_ms: u32,
+    }
     let mut line_keys: BTreeMap<(u8, u32, u8), LineInfo> = BTreeMap::new();
-    let mut voices_raw: Vec<(u8, u32, u8, u8, u8, u8, u8, u32, u32)> = Vec::new(); // (plugin, formid, response, race, sex, voice_race, flags, wem, duration)
-    let mut stats = VoiceStats { assets: parsed.len(), voices: 0, lines: 0, with_text: 0, named_speaker: 0, with_length: 0 };
+    let mut voices_raw: Vec<RawVoice> = Vec::new();
+    let mut stats = VoiceStats { voices: 0, lines: 0, with_text: 0, named_speaker: 0, with_length: 0 };
     for p in &parsed {
         let plugin = folder_to_plugin.get(&p.asset.plugin_folder).copied().unwrap_or(u8::MAX);
         let key = (plugin, p.asset.formid, p.asset.response);
-        if !line_keys.contains_key(&key) {
+        if let std::collections::btree_map::Entry::Vacant(e) = line_keys.entry(key) {
             let info = if plugin != u8::MAX { esm.infos.get(&(plugin, p.asset.formid)) } else { None };
             let mut li = LineInfo { quest: String::new(), topic: String::new(), text: String::new(), speaker: String::new(), named: false };
             // Names and texts in the plugins are localisation keys; resolve them through the locres.
@@ -277,7 +289,7 @@ pub fn build<R: Read + Seek>(
                 names.dedup();
                 if !names.is_empty() {
                     li.named = true;
-                    li.speaker = if names.len() <= 3 { names.join(", ") } else { format!("{}, {} +{} more", names[0], names[1], names.len() - 2) };
+                    li.speaker = names.join(", ");
                 } else if let Some(f) = info.factions.iter().filter_map(|k| disp(*k)).next() {
                     li.speaker = format!("{f} members");
                 } else if let Some(c) = info.classes.iter().filter_map(|k| disp(*k)).next() {
@@ -290,12 +302,22 @@ pub fn build<R: Read + Seek>(
             if li.quest.is_empty() {
                 li.quest = p.asset.quest_topic.split('_').next().unwrap_or("").to_string();
             }
-            line_keys.insert(key, li);
+            e.insert(li);
         }
         let race = race_id(&p.asset.race, &mut races);
         let voice_race = race_id(&p.voice_race, &mut races);
         let duration = durations.get(&p.wem_id).copied().unwrap_or(0);
-        voices_raw.push((plugin, p.asset.formid, p.asset.response, race, p.asset.sex, voice_race, if p.asset.alt { VOICE_ALT } else { 0 }, p.wem_id, duration));
+        voices_raw.push(RawVoice {
+            plugin,
+            formid: p.asset.formid,
+            response: p.asset.response,
+            race,
+            sex: p.asset.sex,
+            voice_race,
+            flags: if p.asset.alt { VOICE_ALT } else { 0 },
+            wem_id: p.wem_id,
+            duration_ms: duration,
+        });
     }
     for li in line_keys.values() {
         for s in [&li.quest, &li.topic, &li.text, &li.speaker] {
@@ -348,24 +370,21 @@ pub fn build<R: Read + Seek>(
 
     let mut voices: Vec<VoiceRec> = voices_raw
         .iter()
-        .map(|&(plugin, formid, response, race, sex, voice_race, flags, wem_id, duration_ms)| VoiceRec {
-            wem_id,
-            line: line_index[&(plugin, formid, response)],
-            race,
-            sex,
-            voice_race,
-            flags,
-            duration_ms,
+        .map(|r| VoiceRec {
+            wem_id: r.wem_id,
+            line: line_index[&(r.plugin, r.formid, r.response)],
+            race: r.race,
+            sex: r.sex,
+            voice_race: r.voice_race,
+            flags: r.flags,
+            duration_ms: r.duration_ms,
         })
         .collect();
-    // One record per voice file: a recording is shared by every race that uses
-    // the same actor (an Orc line points at the Nord file), so keep the first
-    // event in display order and let `voice_race` say who actually speaks.
     voices.sort_by_key(|v| (v.line, v.race, v.sex, v.flags, v.wem_id));
-    let mut seen = std::collections::HashSet::with_capacity(voices.len());
-    voices.retain(|v| seen.insert(v.wem_id));
+    // One recording often serves several race folders (and occasionally several
+    // lines): every voice event keeps its own row and `by_wem` carries duplicates.
     let mut by_wem: Vec<u32> = (0..voices.len() as u32).collect();
-    by_wem.sort_by_key(|&i| voices[i as usize].wem_id);
+    by_wem.sort_by_key(|&i| (voices[i as usize].wem_id, i));
     stats.voices = voices.len();
     stats.with_length = voices.iter().filter(|v| v.duration_ms > 0).count();
 

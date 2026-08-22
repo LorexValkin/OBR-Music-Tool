@@ -240,11 +240,9 @@ pub fn encode_to_wem(source: &Path, output: &Path) -> Result<()> {
 }
 
 fn find_wem_in_dir(dir: &Path) -> Result<Option<PathBuf>> {
-    for entry in walkdir::WalkDir::new(dir).max_depth(3) {
-        if let Ok(e) = entry {
-            if e.path().extension().map(|x| x == "wem").unwrap_or(false) {
-                return Ok(Some(e.path().to_path_buf()));
-            }
+    for e in walkdir::WalkDir::new(dir).max_depth(3).into_iter().flatten() {
+        if e.path().extension().map(|x| x == "wem").unwrap_or(false) {
+            return Ok(Some(e.path().to_path_buf()));
         }
     }
     Ok(None)

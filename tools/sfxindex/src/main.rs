@@ -89,7 +89,7 @@ fn find_paks_dir(root: &Path) -> Result<PathBuf> {
         root.join("Paks"),
     ];
     for c in candidates {
-        if c.is_dir() && fs::read_dir(&c)?.flatten().any(|e| e.path().extension().map_or(false, |x| x == "utoc")) {
+        if c.is_dir() && fs::read_dir(&c)?.flatten().any(|e| e.path().extension().is_some_and(|x| x == "utoc")) {
             return Ok(c);
         }
     }
@@ -101,9 +101,9 @@ fn find_main_container(paks: &Path) -> Result<PathBuf> {
     let mut best: Option<(u64, PathBuf)> = None;
     for entry in fs::read_dir(paks)?.flatten() {
         let p = entry.path();
-        if p.extension().map_or(false, |x| x == "utoc") && !p.file_stem().map_or(false, |s| s.eq_ignore_ascii_case("global")) {
+        if p.extension().is_some_and(|x| x == "utoc") && !p.file_stem().is_some_and(|s| s.eq_ignore_ascii_case("global")) {
             let size = entry.metadata()?.len();
-            if best.as_ref().map_or(true, |(s, _)| size > *s) {
+            if best.as_ref().is_none_or(|(s, _)| size > *s) {
                 best = Some((size, p));
             }
         }
@@ -121,7 +121,15 @@ fn main() -> Result<()> {
     println!("container: {}", utoc_path.display());
 
     let utoc = iostore::Utoc::open(&utoc_path)?;
-    println!("utoc v{} · {} chunks · {} files · methods {:?}", utoc.version, utoc.chunk_count(), utoc.files.len(), utoc.methods);
+    println!(
+        "utoc v{} · flags {:#04x} · mount {} · {} chunks · {} files · methods {:?}",
+        utoc.version,
+        utoc.container_flags,
+        utoc.mount_point,
+        utoc.chunk_count(),
+        utoc.files.len(),
+        utoc.methods
+    );
     let pak = pak::PakIndex::read(&pak_path, |_| true).with_context(|| format!("reading {}", pak_path.display()))?;
     println!("pak v{} · {} entries", pak.version, pak.entries.len());
 
@@ -298,7 +306,7 @@ fn main() -> Result<()> {
         let old_bin = fs::read(&bin_path).unwrap_or_default();
         let old_tsv = fs::read_to_string(&tsv_path).unwrap_or_default();
         let old_voice = fs::read(&voice_path).unwrap_or_default();
-        let voice_ok = voice_blob.as_ref().map_or(true, |v| *v == old_voice);
+        let voice_ok = voice_blob.as_ref().is_none_or(|v| *v == old_voice);
         if old_bin == blob && old_tsv == text && voice_ok {
             println!("check: up to date");
             return Ok(());

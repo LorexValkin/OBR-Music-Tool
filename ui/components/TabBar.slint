@@ -7,83 +7,124 @@ export struct TabInfo {
     available: bool,
 }
 
-// Segmented tab strip. `queued` shows a badge with the number of sounds queued in that tab.
+// One tab of the strip: label, queued badge, selection underline.
+component TabButton inherits Rectangle {
+    in property <TabInfo> tab;
+    in property <bool> selected;
+    in property <bool> enabled: true;
+    /// Takes no space (used by the row of a split strip this tab is not in).
+    in property <bool> collapsed: false;
+    callback activate();
+
+    visible: !root.collapsed;
+    max-width: root.collapsed ? 0px : 10000px;
+    horizontal-stretch: root.collapsed ? 0 : 1;
+    border-radius: 3px;
+    background: root.selected ? Theme.surface-raised
+        : touch.has-hover ? Theme.action-hover
+        : transparent;
+    animate background { duration: 120ms; }
+    accessible-role: button;
+    accessible-label: root.tab.label;
+    accessible-action-default => { root.activate(); }
+
+    if !root.collapsed : HorizontalLayout {
+        alignment: center;
+        spacing: 5px;
+        padding-left: 6px;
+        padding-right: 6px;
+
+        Text {
+            text: root.tab.short-label;
+            color: !root.tab.available ? Theme.text-muted.transparentize(0.45)
+                : root.selected ? Theme.text-primary
+                : Theme.text-muted;
+            font-size: 11px;
+            font-weight: root.selected ? 700 : 600;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        if root.tab.queued > 0 : Rectangle {
+            width: 20px;
+            height: 16px;
+            border-radius: 8px;
+            background: Theme.warning;
+
+            Text {
+                text: "" + root.tab.queued;
+                color: #000000;
+                font-size: 10px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    if !root.collapsed : Rectangle {
+        x: 4px;
+        y: parent.height - 2px;
+        width: parent.width - 8px;
+        height: 2px;
+        background: root.selected ? Theme.focus-ring : transparent;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.activate(); }
+    }
+}
+
+// Segmented tab strip. `queued` shows a badge with the number of sounds queued in
+// that tab. In narrow windows (`two-rows`) the strip splits into two rows so the
+// labels stay readable instead of being cut short.
 export component TabBar inherits Rectangle {
     in property <[TabInfo]> tabs;
     in-out property <int> current: 0;
     in property <bool> enabled: true;
+    in property <bool> two-rows: false;
     callback selected(int);
 
-    height: 36px;
+    property <int> split: (root.tabs.length + 1) / 2;
+
+    height: root.two-rows ? 68px : 36px;
+    animate height { duration: 120ms; }
     vertical-stretch: 0;
     background: Theme.surface-muted;
     border-color: Theme.border;
     border-width: 1px;
     border-radius: 4px;
 
-    HorizontalLayout {
+    VerticalLayout {
         padding: 3px;
         spacing: 2px;
 
-        for tab[i] in root.tabs : Rectangle {
-            horizontal-stretch: 1;
-            border-radius: 3px;
-            background: i == root.current ? Theme.surface-raised
-                : touch.has-hover ? Theme.action-hover
-                : transparent;
-            animate background { duration: 120ms; }
-            accessible-role: button;
-            accessible-label: tab.label;
-            accessible-action-default => {
-                root.current = i;
-                root.selected(i);
-            }
+        // Row 1: every tab, or the first half when split (the rest collapse to 0 width).
+        HorizontalLayout {
+            spacing: 2px;
 
-            HorizontalLayout {
-                alignment: center;
-                spacing: 5px;
-                padding-left: 6px;
-                padding-right: 6px;
-
-                Text {
-                    text: tab.short-label;
-                    color: !tab.available ? Theme.text-muted.transparentize(0.45)
-                        : i == root.current ? Theme.text-primary
-                        : Theme.text-muted;
-                    font-size: 11px;
-                    font-weight: i == root.current ? 700 : 600;
-                    vertical-alignment: center;
-                    overflow: elide;
-                }
-
-                if tab.queued > 0 : Rectangle {
-                    width: 20px;
-                    height: 16px;
-                    border-radius: 8px;
-                    background: Theme.warning;
-
-                    Text {
-                        text: "" + tab.queued;
-                        color: #000000;
-                        font-size: 10px;
-                        font-weight: 700;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-            }
-
-            Rectangle {
-                x: 4px;
-                y: parent.height - 2px;
-                width: parent.width - 8px;
-                height: 2px;
-                background: i == root.current ? Theme.focus-ring : transparent;
-            }
-
-            touch := TouchArea {
+            for tab[i] in root.tabs : TabButton {
+                tab: tab;
+                selected: i == root.current;
                 enabled: root.enabled;
-                clicked => {
+                collapsed: root.two-rows && i >= root.split;
+                activate => {
+                    root.current = i;
+                    root.selected(i);
+                }
+            }
+        }
+
+        if root.two-rows : HorizontalLayout {
+            spacing: 2px;
+
+            for tab[i] in root.tabs : TabButton {
+                tab: tab;
+                selected: i == root.current;
+                enabled: root.enabled;
+                collapsed: i < root.split;
+                activate => {
                     root.current = i;
                     root.selected(i);
                 }

@@ -290,7 +290,7 @@ impl SfxIndex {
                 contains_ci(ev.name, tok)
                     || contains_ci(self.groups[ev.group as usize].name, tok)
                     || contains_ci(ev.path, tok)
-                    || self.media_of(ev).any(|(_, w)| w.wav.map_or(false, |wav| contains_ci(wav, tok)))
+                    || self.media_of(ev).any(|(_, w)| w.wav.is_some_and(|wav| contains_ci(wav, tok)))
                     || (tok.bytes().all(|b| b.is_ascii_digit())
                         && self.media_of(ev).any(|(_, w)| w.id.to_string().starts_with(tok.as_str())))
             });
