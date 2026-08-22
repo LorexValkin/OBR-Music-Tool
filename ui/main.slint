@@ -25,6 +25,7 @@ export struct TrackEntry {
     kind: int,            // 0 = sound (event) row, 1 = variation row of an expanded sound
     variation: int,       // 1-based variation number on variation rows, else 0
     expanded: bool,       // sound rows: variations currently shown beneath
+    length: string,       // play length ("1.4 s", "0:02"), "" when unknown
     group: string,        // Music: category; sounds: group sub-heading; variation rows: "variation N"
     name: string,         // Music: track name; sounds: event name (ui_menu_ok)
     detail: string,       // sounds: source wav of the first variation
@@ -570,7 +571,7 @@ export component AppWindow inherits Window {
                             spacing: 8px;
 
                             Text {
-                                width: root.is-music-tab ? 80px : 104px;
+                                width: root.is-music-tab ? 80px : 92px;
                                 text: root.is-music-tab ? "Category" : "Group";
                                 color: Theme.text-muted;
                                 font-size: 11px;
@@ -586,13 +587,22 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                             }
                             Text {
-                                width: root.is-music-tab ? 70px : 168px;
+                                width: root.is-music-tab ? 70px : 140px;
                                 text: root.is-music-tab ? "Size" : "Source file";
                                 color: Theme.text-muted;
                                 font-size: 11px;
                                 font-weight: 700;
                                 vertical-alignment: center;
                                 horizontal-alignment: root.is-music-tab ? right : left;
+                            }
+                            Text {
+                                width: 64px;
+                                text: "Length";
+                                color: Theme.text-muted;
+                                font-size: 11px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
                             }
                             Text {
                                 width: 80px;
@@ -624,13 +634,45 @@ export component AppWindow inherits Window {
                         vertical-stretch: 1;
 
                         for entry[index] in root.track-list : Rectangle {
-                            height: 34px;
+                            // Variation rows grow in instead of popping into place.
+                            property <bool> shown: false;
+                            init => { shown = true; }
+                            height: (entry.kind == 1 && !shown) ? 0px : 36px;
+                            animate height { duration: 180ms; easing: ease-out; }
+                            opacity: (entry.kind == 1 && !shown) ? 0 : 1;
+                            animate opacity { duration: 180ms; easing: ease-out; }
+                            clip: true;
                             background: entry.kind == 1 ? Theme.surface-muted.transparentize(0.5)
                                 : touch-row.has-hover ? Theme.surface-raised
                                 : transparent;
                             border-radius: 3px;
 
-                            touch-row := TouchArea {}
+                            // Double-click anywhere on a sound row to show/hide its variations.
+                            touch-row := TouchArea {
+                                double-clicked => {
+                                    if (entry.kind == 0 && entry.variations > 1) {
+                                        root.toggle-expand(entry.event);
+                                    }
+                                }
+                            }
+
+                            // Hairline between rows.
+                            Rectangle {
+                                x: 8px;
+                                y: parent.height - 1px;
+                                width: parent.width - 16px;
+                                height: 1px;
+                                background: Theme.border;
+                            }
+
+                            // Accent bar tying variation rows to their sound.
+                            if entry.kind == 1 : Rectangle {
+                                x: 14px;
+                                y: 5px;
+                                width: 2px;
+                                height: parent.height - 10px;
+                                background: Theme.border-strong;
+                            }
 
                             // ---------------- sound row ----------------
                             if entry.kind == 0 : HorizontalLayout {
@@ -639,7 +681,7 @@ export component AppWindow inherits Window {
                                 spacing: 8px;
 
                                 Text {
-                                    width: root.is-music-tab ? 80px : 104px;
+                                    width: root.is-music-tab ? 80px : 92px;
                                     text: entry.group;
                                     color: Theme.text-secondary;
                                     font-size: 12px;
@@ -657,7 +699,9 @@ export component AppWindow inherits Window {
                                         accessible-label: (entry.expanded ? "Collapse " : "Expand ") + entry.name;
                                         accessible-action-default => { root.toggle-expand(entry.event); }
                                         if entry.variations > 1 : Text {
-                                            text: entry.expanded ? "\u{25be}" : "\u{25b8}";
+                                            text: "\u{25b8}";
+                                            rotation-angle: entry.expanded ? 90deg : 0deg;
+                                            animate rotation-angle { duration: 160ms; easing: ease-in-out; }
                                             color: chevron.has-hover ? Theme.text-primary : Theme.text-muted;
                                             font-size: 13px;
                                             vertical-alignment: center;
@@ -706,7 +750,7 @@ export component AppWindow inherits Window {
                                 }
 
                                 Text {
-                                    width: root.is-music-tab ? 70px : 168px;
+                                    width: root.is-music-tab ? 70px : 140px;
                                     text: root.is-music-tab
                                         ? (entry.replacement != "" ? "" : entry.size)
                                         : entry.detail;
@@ -715,6 +759,15 @@ export component AppWindow inherits Window {
                                     vertical-alignment: center;
                                     horizontal-alignment: root.is-music-tab ? right : left;
                                     overflow: elide;
+                                }
+
+                                Text {
+                                    width: 64px;
+                                    text: entry.length;
+                                    color: Theme.text-muted;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: right;
                                 }
 
                                 Text {
@@ -776,7 +829,7 @@ export component AppWindow inherits Window {
                                 spacing: 8px;
 
                                 Text {
-                                    width: root.is-music-tab ? 80px : 104px;
+                                    width: root.is-music-tab ? 80px : 92px;
                                     text: "\u{21b3} " + entry.group;
                                     color: Theme.text-muted;
                                     font-size: 11px;
@@ -814,13 +867,22 @@ export component AppWindow inherits Window {
                                 }
 
                                 Text {
-                                    width: root.is-music-tab ? 70px : 168px;
+                                    width: root.is-music-tab ? 70px : 140px;
                                     text: entry.detail;
                                     color: Theme.text-muted;
                                     font-size: 11px;
                                     vertical-alignment: center;
                                     horizontal-alignment: root.is-music-tab ? right : left;
                                     overflow: elide;
+                                }
+
+                                Text {
+                                    width: 64px;
+                                    text: entry.length;
+                                    color: Theme.text-muted;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: right;
                                 }
 
                                 Text {

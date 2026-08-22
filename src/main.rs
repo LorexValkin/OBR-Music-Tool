@@ -24,6 +24,7 @@ mod sfx_index;
 mod wem;
 mod wem_decode;
 mod wem_encoder;
+mod wem_info;
 
 use sfx_index::{SfxIndex, TabKind};
 use wem_encoder::find_wwise_cli;
@@ -970,9 +971,14 @@ fn entry_for_event(index: &SfxIndex, st: &AppState, event: u32, expanded: bool) 
     let mut shared = 0usize;
     let mut replacement: Option<&Replacement> = None;
     let mut first_wem: Option<&sfx_index::Wem> = None;
+    let (mut min_ms, mut max_ms) = (u32::MAX, 0u32);
     for (wi, wem) in index.media_of(ev) {
         total += 1;
         first_wem.get_or_insert(wem);
+        if wem.duration_ms > 0 {
+            min_ms = min_ms.min(wem.duration_ms);
+            max_ms = max_ms.max(wem.duration_ms);
+        }
         shared = shared.max(index.events_sharing(wi).len().saturating_sub(1));
         if let Some(r) = st.replacements.get(&wem.id) {
             replaced += 1;
@@ -1016,11 +1022,14 @@ fn entry_for_event(index: &SfxIndex, st: &AppState, event: u32, expanded: bool) 
         (index.group(ev).name.to_string(), ev.name.to_string(), String::new(), detail, st.game_root.is_some())
     };
 
+    let length = length_label(min_ms, max_ms);
+
     TrackEntry {
         event: event as i32,
         kind: 0,
         variation: 0,
         expanded,
+        length: length.into(),
         group: group.into(),
         name: name.into(),
         detail: detail.into(),
@@ -1031,6 +1040,19 @@ fn entry_for_event(index: &SfxIndex, st: &AppState, event: u32, expanded: bool) 
         shared: shared as i32,
         warning: ev.prefetch_suspect(),
         can_play,
+    }
+}
+
+/// `1.4 s` for one length, `0.9–1.4 s` when the variations differ, empty when unknown.
+fn length_label(min_ms: u32, max_ms: u32) -> String {
+    if max_ms == 0 || min_ms == u32::MAX {
+        return String::new();
+    }
+    let (lo, hi) = (wem_info::format_duration_ms(min_ms), wem_info::format_duration_ms(max_ms));
+    if lo == hi {
+        lo
+    } else {
+        format!("{}\u{2013}{}", lo.trim_end_matches(" s"), hi)
     }
 }
 
@@ -1051,6 +1073,7 @@ fn entry_for_variation(index: &SfxIndex, st: &AppState, event: u32, variation: u
         kind: 1,
         variation: variation as i32 + 1,
         expanded: false,
+        length: wem_info::format_duration_ms(wem.duration_ms).into(),
         group: format!("variation {}", variation + 1).into(),
         name: wem.wav.map(str::to_string).unwrap_or_else(|| format!("wem {}", wem.id)).into(),
         detail: format!("id {}", wem.id).into(),
@@ -1706,9 +1729,13 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let model = model.clone();
         app.on_toggle_expand(move |event| {
-            if event >= 0 && (event as usize) < SfxIndex::get().events().len() {
-                model.toggle_expand(event as u32);
+            if event < 0 || (event as usize) >= SfxIndex::get().events().len() {
+                return;
             }
+            // Defer past the current click sequence so the rows that appear never land
+            // under the pointer mid-click (a double-click could otherwise reach a new Play button).
+            let model = model.clone();
+            Timer::single_shot(Duration::from_millis(60), move || model.toggle_expand(event as u32));
         });
     }
 

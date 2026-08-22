@@ -22,7 +22,7 @@
 use std::fmt;
 
 pub const MAGIC: &[u8; 8] = b"OBRSFXIX";
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 pub const HEADER_SIZE: usize = 80;
 /// "No string" marker (used for a wem without a known source wav).
 pub const NONE: u32 = u32::MAX;
@@ -30,7 +30,7 @@ pub const NONE: u32 = u32::MAX;
 pub const TAB_REC_SIZE: usize = 16;
 pub const GROUP_REC_SIZE: usize = 16;
 pub const EVENT_REC_SIZE: usize = 20;
-pub const WEM_REC_SIZE: usize = 16;
+pub const WEM_REC_SIZE: usize = 20;
 
 /// Index flags.
 pub const INDEX_FLAG_VOICE: u16 = 1;
@@ -100,6 +100,8 @@ pub struct WemRec {
     pub first_event: u32,
     pub event_count: u16,
     pub flags: u16,
+    /// Play length in milliseconds (0 = unknown).
+    pub duration_ms: u32,
 }
 
 /// Everything needed to encode an index (the writer's input, the reader's output).
@@ -232,6 +234,7 @@ pub fn encode(t: &Tables) -> Result<Vec<u8>, FormatError> {
         put_u32(&mut out, w.first_event);
         put_u16(&mut out, w.event_count);
         put_u16(&mut out, w.flags);
+        put_u32(&mut out, w.duration_ms);
     }
     for &e in &t.wem_events {
         put_u32(&mut out, e);
@@ -506,7 +509,7 @@ impl<'a> RawIndex<'a> {
 
     pub fn wem(&self, i: usize) -> WemRec {
         let b = &self.wems[i * WEM_REC_SIZE..];
-        WemRec { id: rd_u32(b, 0), wav: rd_u32(b, 4), first_event: rd_u32(b, 8), event_count: rd_u16(b, 12), flags: rd_u16(b, 14) }
+        WemRec { id: rd_u32(b, 0), wav: rd_u32(b, 4), first_event: rd_u32(b, 8), event_count: rd_u16(b, 12), flags: rd_u16(b, 14), duration_ms: rd_u32(b, 16) }
     }
 
     pub fn wem_event(&self, i: usize) -> u32 {
@@ -575,10 +578,10 @@ pub(crate) mod tests {
             // wems (ascending id): 100 -> ui_menu_ok, 200 -> shared select, 300 -> chest, 400 -> unpaired
             media_refs: vec![0, 1, 1, 2, 3],
             wems: vec![
-                WemRec { id: 100, wav: 13, first_event: 0, event_count: 1, flags: 0 },
-                WemRec { id: 200, wav: 14, first_event: 1, event_count: 2, flags: WEM_SHARED },
-                WemRec { id: 300, wav: 15, first_event: 3, event_count: 1, flags: 0 },
-                WemRec { id: 400, wav: NONE, first_event: 4, event_count: 1, flags: 0 },
+                WemRec { id: 100, wav: 13, first_event: 0, event_count: 1, flags: 0, duration_ms: 2037 },
+                WemRec { id: 200, wav: 14, first_event: 1, event_count: 2, flags: WEM_SHARED, duration_ms: 500 },
+                WemRec { id: 300, wav: 15, first_event: 3, event_count: 1, flags: 0, duration_ms: 1000 },
+                WemRec { id: 400, wav: NONE, first_event: 4, event_count: 1, flags: 0, duration_ms: 0 },
             ],
             wem_events: vec![0, 0, 1, 2, 3],
         }

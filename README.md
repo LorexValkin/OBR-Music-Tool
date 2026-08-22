@@ -29,8 +29,9 @@ Before converting audio you will need Wwise Authoring installed once; see [Insta
   carry the game's own names (for example `obj_drs_chest_open`, source file `al_obj_drs_chest_open.wav`), so you are
   never guessing from numeric ids. Tabs show 50 sounds per page; the search box covers the whole tab.
 - **Previews everything.** Music plays from the game's loose mp3s; sound effects are read straight out of the
-  game's pak (read-only) and decoded in the app. Sounds with several *variations* expand so each variation can be
-  previewed or replaced on its own.
+  game's pak (read-only) and decoded in the app. Sounds with several *variations* expand (click the arrow or
+  double-click the row) so each variation can be previewed or replaced on its own, and every row shows its play
+  length.
 - **Accepts normal audio files** as replacements: `.mp3`, `.wav`, `.ogg`, `.flac` (or pre-encoded `.wem`).
 - **Converts them to the game's format** (Wwise Vorbis `.wem`) using Audiokinetic's own encoder, so the output is exactly what the game expects.
 - **Builds a UE5 patch `.pak`** that overrides the original tracks. Your game files are never modified; delete the pak and everything is vanilla again.
@@ -95,8 +96,8 @@ You can uninstall Wwise from the Launcher at any time; only the `.wem` conversio
    search box to filter it; searching matches the sound name, its group and its source file name, across the whole
    tab (the list shows 50 sounds per page). Click **Play** to hear the original; sound effects are read straight from
    the game files. Click **Replace** to pick an audio file for a sound. A sound with *N variations* (random
-   alternatives the game picks from) gets the same file on all of them; click the small arrow next to its name to
-   list the variations and play, replace or remove each one individually (the sound then shows as *partial* until
+   alternatives the game picks from) gets the same file on all of them; click the small arrow next to its name (or
+   double-click the row) to list the variations and play, replace or remove each one individually (the sound then shows as *partial* until
    every variation is replaced). Queued sounds show the chosen file name in orange and a badge on their tab;
    **Remove** un-queues one and **Clear all** resets everything. Replacement audio can be any length, sample rate
    or channel layout.

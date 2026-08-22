@@ -90,7 +90,7 @@ pub fn natural_key(s: &str) -> String {
     out
 }
 
-pub fn build(mut events: Vec<RawEvent>, utoc_fingerprint: u64, utoc_entry_count: u32, pak_index_hash: [u8; 20]) -> (Tables, Stats) {
+pub fn build(mut events: Vec<RawEvent>, utoc_fingerprint: u64, utoc_entry_count: u32, pak_index_hash: [u8; 20], durations: &HashMap<u32, u32>) -> (Tables, Stats) {
     events.sort_by_cached_key(sort_key);
 
     // Wem table: id -> (wav, localised, events)
@@ -226,7 +226,14 @@ pub fn build(mut events: Vec<RawEvent>, utoc_fingerprint: u64, utoc_entry_count:
         if wav.is_some() {
             stats.paired += 1;
         }
-        wems.push(WemRec { id, wav: wav.as_deref().map(s).unwrap_or(NONE), first_event, event_count: evs.len() as u16, flags });
+        wems.push(WemRec {
+            id,
+            wav: wav.as_deref().map(s).unwrap_or(NONE),
+            first_event,
+            event_count: evs.len() as u16,
+            flags,
+            duration_ms: durations.get(&id).copied().unwrap_or(0),
+        });
     }
 
     stats.events = events.len();
@@ -277,8 +284,9 @@ mod tests {
         ];
         let mut shuffled = events.clone();
         shuffled.reverse();
-        let (a, stats) = build(events, 1, 2, [3; 20]);
-        let (b, _) = build(shuffled, 1, 2, [3; 20]);
+        let durations: HashMap<u32, u32> = [(100, 2037), (300, 1000)].into_iter().collect();
+        let (a, stats) = build(events, 1, 2, [3; 20], &durations);
+        let (b, _) = build(shuffled, 1, 2, [3; 20], &durations);
         assert_eq!(a, b);
         let blob = encode(&a).unwrap();
         let raw = RawIndex::parse(&blob).unwrap();
@@ -296,6 +304,9 @@ mod tests {
         assert_eq!(w.flags & WEM_SHARED, WEM_SHARED);
         let e0 = raw.event(0);
         assert_eq!(e0.flags & EV_HAS_SHARED_MEDIA, EV_HAS_SHARED_MEDIA);
+        let w100 = (0..raw.header.wem_count as usize).map(|i| raw.wem(i)).find(|w| w.id == 100).unwrap();
+        assert_eq!(w100.duration_ms, 2037);
+        assert_eq!(w.duration_ms, 0);
     }
 
     #[test]

@@ -243,6 +243,43 @@ impl PakIndex {
         }
     }
 
+    /// Read up to `max_bytes` from the start of an entry (whole blocks are
+    /// decompressed until enough bytes are available).
+    pub fn read_entry_prefix<R: Read + Seek>(&self, pak: &mut R, entry: &PakEntry, dec: &mut dyn Decompressor, max_bytes: usize) -> Result<Vec<u8>> {
+        if entry.encrypted {
+            bail!("pak: entry is encrypted");
+        }
+        let want = (entry.uncompressed_size as usize).min(max_bytes);
+        if entry.method == 0 {
+            pak.seek(SeekFrom::Start(entry.offset + entry.header_size))?;
+            let mut out = vec![0u8; want];
+            pak.read_exact(&mut out).context("pak: reading entry")?;
+            return Ok(out);
+        }
+        let method = self.method_name(entry).to_string();
+        let mut out = Vec::with_capacity(want.max(entry.block_size as usize));
+        let mut remaining = entry.uncompressed_size;
+        let mut compressed = Vec::new();
+        let mut raw = Vec::new();
+        for (i, &(start, end)) in entry.blocks.iter().enumerate() {
+            if out.len() >= want || remaining == 0 {
+                break;
+            }
+            compressed.clear();
+            compressed.resize((end - start) as usize, 0);
+            pak.seek(SeekFrom::Start(entry.offset + start))?;
+            pak.read_exact(&mut compressed).with_context(|| format!("pak: reading block {i}"))?;
+            let block = entry.block_size.min(remaining) as usize;
+            raw.clear();
+            raw.resize(block, 0);
+            dec.decompress(&method, &compressed, &mut raw).with_context(|| format!("pak: decompressing block {i}"))?;
+            out.extend_from_slice(&raw);
+            remaining -= block as u64;
+        }
+        out.truncate(want);
+        Ok(out)
+    }
+
     /// Read and decompress one entry.
     pub fn read_entry<R: Read + Seek>(&self, pak: &mut R, entry: &PakEntry, dec: &mut dyn Decompressor) -> Result<Vec<u8>> {
         if entry.encrypted {
@@ -336,8 +373,10 @@ mod tests {
         pak.extend_from_slice(b"hello wor");
         pak.extend_from_slice(b"ld!");
         let entry = PakEntry { offset: 0, uncompressed_size: 12, size: 12, method: 1, encrypted: false, block_size: 9, blocks: vec![(10, 19), (19, 22)], header_size: 10 };
-        let out = index.read_entry(&mut std::io::Cursor::new(pak), &entry, &mut NoDecompress).unwrap();
+        let out = index.read_entry(&mut std::io::Cursor::new(pak.clone()), &entry, &mut NoDecompress).unwrap();
         assert_eq!(out, b"hello world!");
+        let head = index.read_entry_prefix(&mut std::io::Cursor::new(pak), &entry, &mut NoDecompress, 4).unwrap();
+        assert_eq!(head, b"hell");
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub fn render(raw: &RawIndex, hidden: &[(String, String)]) -> String {
         "# sfxindex format={} rules={} utoc_fingerprint={:016x} pak_index_hash={} events={} wems={} media_refs={}",
         h.version, h.rules_version, h.utoc_fingerprint, hex(&h.pak_index_hash), h.event_count, h.wem_count, h.media_ref_count
     );
-    out.push_str("tab\tgroup\tevent_path\twem_id\tsource_wav\tflags\n");
+    out.push_str("tab\tgroup\tevent_path\twem_id\tsource_wav\tflags\tlength_ms\n");
     for ti in 0..h.tab_count as usize {
         let tab = raw.tab(ti);
         let tab_name = raw.string(tab.name);
@@ -45,14 +45,14 @@ pub fn render(raw: &RawIndex, hidden: &[(String, String)]) -> String {
             for mi in ev.first_media..ev.first_media + ev.media_count as u32 {
                 let wem = raw.wem(raw.media_ref(mi as usize) as usize);
                 let wav = if wem.wav == NONE { "" } else { raw.string(wem.wav) };
-                let _ = writeln!(out, "{tab_name}\t{group}\t{path}\t{}\t{wav}\t{flags}", wem.id);
+                let _ = writeln!(out, "{tab_name}\t{group}\t{path}\t{}\t{wav}\t{flags}\t{}", wem.id, wem.duration_ms);
             }
         }
     }
     let mut hidden: Vec<&(String, String)> = hidden.iter().collect();
     hidden.sort();
     for (path, reason) in hidden {
-        let _ = writeln!(out, "(hidden)\t{reason}\t{path}\t\t\t");
+        let _ = writeln!(out, "(hidden)\t{reason}\t{path}\t\t\t\t");
     }
     out
 }

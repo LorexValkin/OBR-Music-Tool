@@ -129,6 +129,8 @@ pub struct Wem {
     pub localised: bool,
     /// Referenced by more than one event.
     pub shared: bool,
+    /// Play length in milliseconds (0 = unknown).
+    pub duration_ms: u32,
     pub events: Range<u32>,
 }
 
@@ -191,6 +193,7 @@ impl SfxIndex {
                     wav: if w.wav == NONE { None } else { Some(raw.string(w.wav)) },
                     localised: w.flags & WEM_LOCALISED != 0,
                     shared: w.flags & WEM_SHARED != 0,
+                    duration_ms: w.duration_ms,
                     events: w.first_event..w.first_event + w.event_count as u32,
                 }
             })

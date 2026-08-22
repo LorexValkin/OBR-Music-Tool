@@ -16,6 +16,9 @@ mod pak;
 #[allow(dead_code)]
 #[path = "../../../src/oodle.rs"]
 mod oodle;
+#[allow(dead_code)]
+#[path = "../../../src/wem_info.rs"]
+mod wem_info;
 
 mod assemble;
 mod rules;
@@ -25,6 +28,7 @@ mod zen;
 use anyhow::{bail, Context, Result};
 use assemble::RawEvent;
 use rules::{Class, TabKind};
+use std::collections::HashMap;
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -184,8 +188,37 @@ fn main() -> Result<()> {
         bail!("{} media are not loose in the pak", missing_loose.len());
     }
 
+    // Play lengths from the wem headers (first block of each file only).
+    let durations = {
+        let mut ids: Vec<(u32, bool)> = events.iter().flat_map(|e| e.media.iter().map(|m| (m.id, m.localised))).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut work: Vec<(u64, u32, &pak::PakEntry)> = ids
+            .iter()
+            .filter_map(|&(id, localised)| {
+                let rel = if localised { format!("Media/English(US)/{}.wem", id) } else { format!("Media/{}.wem", id) };
+                pak.entries.get(&rel).map(|e| (e.offset, id, e))
+            })
+            .collect();
+        work.sort_by_key(|w| w.0);
+        let mut file = BufReader::with_capacity(1 << 16, fs::File::open(&pak_path)?);
+        let mut durations: HashMap<u32, u32> = HashMap::new();
+        let mut unknown = 0usize;
+        for (_, id, entry) in work {
+            let head = pak.read_entry_prefix(&mut file, entry, &mut dec, 512).with_context(|| format!("reading header of wem {id}"))?;
+            match wem_info::duration_ms(&head) {
+                Some(ms) => {
+                    durations.insert(id, ms);
+                }
+                None => unknown += 1,
+            }
+        }
+        println!("play lengths: {} known, {} unknown, {:.1?}", durations.len(), unknown, started.elapsed());
+        durations
+    };
+
     let events = assemble::expand_music(events);
-    let (tables, stats) = assemble::build(events, utoc.fingerprint(), utoc.chunk_count() as u32, pak.index_hash);
+    let (tables, stats) = assemble::build(events, utoc.fingerprint(), utoc.chunk_count() as u32, pak.index_hash, &durations);
     let blob = format::encode(&tables)?;
     let raw = format::RawIndex::parse(&blob)?;
     let text = tsv::render(&raw, &hidden);
