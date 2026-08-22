@@ -5,7 +5,7 @@ Pick a file for any of the game's 28 music tracks or ~1,190 sound effects (doors
 creatures, menus, ambience, weather...), click one button, and play. No Unreal Engine, no hex editing, no
 hand-built soundbanks. Everything runs locally on your PC.
 
-![OBR Music Tool](docs/screenshot-2026-08-21.png)
+![OBR Music Tool](docs/screenshot-2026-08-22.png)
 
 ## Download
 
